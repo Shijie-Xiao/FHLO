@@ -1,4 +1,4 @@
-# FHLO — Fast Hurricane Large-ensemble ODE
+# FHLO — Forecasts of Hurricanes Using Large-Ensemble Outputs
 
 A physics-based hurricane intensity forecasting framework that strictly follows
 Lin, Emanuel & Vigh (2020), "Forecasts of Hurricanes Using Large-Ensemble
