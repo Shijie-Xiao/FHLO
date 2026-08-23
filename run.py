@@ -157,33 +157,59 @@ def resolve_member_assignment(synth_nc, n_members, assign):
     return codes[:n_members]
 
 
-def _ens_prep_one(job):
-    """Ensemble prep worker: one (track, member) -> dataset pkl."""
-    import pickle
-    mi, track_csv, out_dir, member_code, gefs_init, gefs_dir = job
-    out_dir = Path(out_dir)
-    name = out_dir.name
-    out_pkl = out_dir / f'{name}_dataset.pkl'
+def _worker_init():
+    """Per-worker: pin BLAS threads to 1 (64 procs x N threads = oversubscribe)."""
+    import os
+    for var in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
+                'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS'):
+        os.environ[var] = '1'
     try:
-        if out_pkl.exists():
-            return mi, True, 'skip (exists)'
+        from threadpoolctl import threadpool_limits
+        threadpool_limits(1)
+    except ImportError:
+        pass
+
+
+def _ens_prep_batch(batch):
+    """Ensemble prep worker: a batch of same-member (track, member) jobs.
+
+    Batching keeps each worker on ONE GEFS member for the whole batch, so the
+    per-worker fhour cache stays hot (3-hourly slabs reused across tracks).
+    Returns [(mi, ok, msg), ...].
+    """
+    import pickle
+    out = []
+    if not batch:
+        return out
+    _, track_csv, out_dir, member_code, gefs_init, gefs_dir = batch[0]
+    try:
         sys.path.insert(0, str(PROJECT_ROOT / 'ensemble'))
         sys.path.insert(0, str(PROJECT_ROOT / 'prep'))
         import gefs_nc_adapter
         gefs_nc_adapter.set_active_member(member_code, gefs_init, gefs_dir)
         gefs_nc_adapter.install()
         import prepare_complete_training_data as prep
-        ds = prep.process_one_storm(track_csv, era5_root_override=None,
-                                    sst_source='ERA5')
-        if ds is None:
-            return mi, False, 'no valid steps'
-        ds['gefs_member'] = member_code
-        with open(out_pkl, 'wb') as f:
-            pickle.dump(ds, f, protocol=4)
-        T = ds['spatial_3d'].shape[1]
-        return mi, True, f'T={T} member={member_code}'
+        for mi, track_csv, out_dir, member_code, gefs_init, gefs_dir in batch:
+            out_dir = Path(out_dir)
+            out_pkl = out_dir / f'{out_dir.name}_dataset.pkl'
+            if out_pkl.exists():
+                out.append((mi, True, 'skip (exists)'))
+                continue
+            try:
+                ds = prep.process_one_storm(track_csv, era5_root_override=None,
+                                            sst_source='ERA5')
+                if ds is None:
+                    out.append((mi, False, 'no valid steps'))
+                    continue
+                ds['gefs_member'] = member_code
+                with open(out_pkl, 'wb') as f:
+                    pickle.dump(ds, f, protocol=4)
+                out.append((mi, True, f'T={ds["spatial_3d"].shape[1]}'))
+            except Exception as e:
+                out.append((mi, False, f'{type(e).__name__}: {e}'))
     except Exception as e:
-        return mi, False, f'{type(e).__name__}: {e}'
+        out.extend((j[0], False, f'init {type(e).__name__}: {e}') for j in batch)
+    return out
 
 
 def _ens_ode_one(job):
@@ -267,17 +293,42 @@ def run_ensemble(args, cfg):
     stages = [s.strip().lower() for s in args.stage.split(',') if s.strip()]
     t0 = time.time()
     if 'eprep' in stages and jobs:
-        print(f'[ens eprep] {len(jobs)} member preps, workers={args.workers}')
+        # group jobs by GEFS member so each worker batch keeps its fhour
+        # cache hot on one member's files; batches sized to keep all
+        # workers busy (ceil(len(jobs)/workers) per member group, split
+        # across workers if one member dominates)
+        from collections import defaultdict
+        by_member = defaultdict(list)
+        for j in jobs:
+            by_member[j[3]].append(j)
+        target_batches = max(args.workers, 1)
+        batches = []
+        for code in sorted(by_member):
+            mj = by_member[code]
+            per = max(1, -(-len(mj) * len(by_member) // max(len(jobs), 1) * 1))
+            # aim: each member's jobs split into ~equal batches matching its share
+            n_split = max(1, round(len(mj) / max(1, len(jobs)) * target_batches))
+            size = -(-len(mj) // n_split)
+            for k in range(0, len(mj), size):
+                batches.append(mj[k:k + size])
+        print(f'[ens eprep] {len(jobs)} member preps in {len(batches)} batches '
+              f'({len(by_member)} GEFS members), workers={args.workers}')
         n_ok = 0
-        with ProcessPoolExecutor(max_workers=args.workers) as ex:
-            futs = {ex.submit(_ens_prep_one, j): j[0] for j in jobs}
-            done = 0
+        with ProcessPoolExecutor(max_workers=args.workers,
+                                 initializer=_worker_init) as ex:
+            futs = {ex.submit(_ens_prep_batch, b): b[0][0] for b in batches}
+            done_batches = 0
             for fut in as_completed(futs):
-                mi, ok, msg = fut.result()
-                n_ok += ok
-                done += 1
-                if not ok or done % 10 == 0 or done == len(jobs):
-                    print(f'  [{"OK" if ok else "FAIL"}] M{mi:03d}: {msg}')
+                results = fut.result()
+                for mi, ok, msg in results:
+                    n_ok += ok
+                    if not ok:
+                        print(f'  [FAIL] M{mi:03d}: {msg}')
+                done_batches += 1
+                n_done = done_batches
+                if done_batches % 5 == 0 or done_batches == len(batches):
+                    print(f'  [eprep] {done_batches}/{len(batches)} batches, '
+                          f'{n_ok} ok ({time.time() - t0:.0f}s)')
         print(f'[ens eprep] done: {n_ok}/{len(jobs)} '
               f'({time.time() - t0:.0f}s)')
 
@@ -286,7 +337,8 @@ def run_ensemble(args, cfg):
                     if (d / f'{d.name}_dataset.pkl').exists()]
         print(f'[ens ode] {len(ode_jobs)} FAST ODE runs, workers={args.workers}')
         n_ok = 0
-        with ProcessPoolExecutor(max_workers=args.workers) as ex:
+        with ProcessPoolExecutor(max_workers=args.workers,
+                                 initializer=_worker_init) as ex:
             futs = {ex.submit(_ens_ode_one, j): j[0] for j in ode_jobs}
             done = 0
             for fut in as_completed(futs):

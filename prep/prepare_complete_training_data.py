@@ -864,6 +864,9 @@ def process_one_storm(track_csv, era5_root_override=None, sst_source='ERA5',
     v_init_val = None
 
     try:
+        import os
+        if os.environ.get('FHLO_TQDM', '0') != '1':
+            raise ImportError
         from tqdm import tqdm
         it = tqdm(df.iterrows(), total=len(df), desc=track_name[:30], ncols=80, leave=False)
     except ImportError:
