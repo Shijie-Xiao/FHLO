@@ -47,7 +47,13 @@ def _compute_6h_velocities(track: Dict[str, Any]) -> Dict[str, Any]:
             dx = (lon_rad[i] - lon_rad[i - 1]) * np.cos(lat_rad[i - 1]) * Earth_Radius
             dy = (lat_rad[i] - lat_rad[i - 1]) * Earth_Radius
             u[i], v[i] = dx / dt_sec, dy / dt_sec
-        u[0], v[0] = u[1], v[1]
+        # Backward-extrapolate the first velocity instead of copying u[1]:
+        # a copied first point makes the step-1 pair (u1,u1) perfectly
+        # correlated, degenerating the conditional fit (A~I, Sigma_cond~0).
+        if n >= 3:
+            u[0], v[0] = 2 * u[1] - u[2], 2 * v[1] - v[2]
+        else:
+            u[0], v[0] = u[1], v[1]
     return {"lon": lon, "lat": lat, "u": u, "v": v, "time": time_np}
 
 
@@ -96,6 +102,10 @@ def run_build_pairs():
             continue
 
         max_len = max(len(r["lon"]) for _, r in processed)
+        # FHLO paper: require >=75% of ALL ensemble members to survive at a
+        # position index before extending the horizon further. This defines
+        # the training horizon ONLY (members are NOT dropped -- all member
+        # displacements within the horizon feed the covariance estimate).
         min_req = int(np.ceil(0.75 * len(processed)))
         max_valid_step = next(
             (i - 1 for i in range(max_len)
@@ -103,11 +113,8 @@ def run_build_pairs():
             max_len - 1
         )
 
-        keep_threshold = int(0.75 * max_len)
         kept_pairs, kept_steps, kept_members = [], [], []
         for tr, r in processed:
-            if len(r["lon"]) < keep_threshold:
-                continue
             truncate_len = min(len(r["lon"]), max_valid_step + 1)
             if truncate_len < 2:
                 continue

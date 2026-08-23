@@ -106,7 +106,7 @@ _ENV_MODE = 'precomputed'   # 'precomputed' (self-contained) | 'era5' (live ERA5
 _ERA5_DIR = None
 _USE_FORCING = True     # apply forecast-phase F_init forcing (False = free physics)
 _REPLAY_UNTIL = None    # >0: force V to obs over [0, this hour] of the FORECAST,
-                        # then release with F_init*exp(-2((t-h_rel)/24h)^2). The
+                        # then release with F_init*exp(-((t-h_rel)/24h)^2). The
                         # classic FHLO replay (pre-ref 48h) still runs first.
 
 
@@ -383,8 +383,9 @@ def _run_member(task):
         # pre-forecast window V is forced to track the (KL-perturbed) observed
         # target; the physics residual F = observed accel - physics rhs is
         # accumulated and its last-12-h mean is carried into the forecast,
-        # decaying as exp(-2 (t/24h)^2) (same constant as run_fast_reference;
-        # the FHLO paper writes exp[-(t/t0)^2], t0 = 1 day).
+        # decaying as exp(-(t/24h)^2), matching the FHLO paper exactly:
+        # "decays in magnitude as exp[-(t/t0)^2], t0 = 1 day" (Lin et al. 2020
+        # section 3e). The legacy constant exp(-2(t/24h)^2) was retired.
         from utils import compute_alpha, compute_beta, compute_gamma, compute_vent
         from constants import Epsilon as _EPS, Kappa as _KAP
         beta_c = compute_beta(_EPS, _KAP)
@@ -461,11 +462,11 @@ def _run_member(task):
             if _USE_FORCING:
                 class ForcedFast(Fast):
                     """FAST + FHLO forecast-phase forcing: dV/dt += F_init *
-                    exp(-2 (t/24h)^2) with F_init converted to per-second."""
+                    exp(-(t/24h)^2) with F_init converted to per-second."""
                     def dydt(self, t, y):
                         d = super().dydt(t, y)
                         lead_h = float(t) / 3600.0
-                        d[2] += (F_init / 3600.0) * np.exp(-2.0 * (lead_h / 24.0) ** 2)
+                        d[2] += (F_init / 3600.0) * np.exp(-(lead_h / 24.0) ** 2)
                         return d
                 solver = ForcedFast
             else:
@@ -503,7 +504,7 @@ def _run_member(task):
     V_ms = np.asarray(sol.y[2], float)
 
     # ---- optional forecast-phase replay: V glued to obs over [0, replay_until],
-    # then released with F_rel * exp(-2((t-h_rel)/24h)^2) forcing (run_fast_ref). ----
+    # then released with F_rel * exp(-((t-h_rel)/24h)^2) forcing (run_fast_ref). ----
     if (_REPLAY_UNTIL is not None and _REPLAY_UNTIL > 0
             and _REPLAY_UNTIL < n_pt - 1 and np.isfinite(v_gt[0])):
         from utils import compute_alpha, compute_beta, compute_gamma
@@ -548,11 +549,11 @@ def _run_member(task):
 
             class ReleasedFast(Fast):
                 """Forecast from the glued state with F_rel decaying as
-                exp(-2 ((t-h_rel)/24h)^2) — same FHLO shape, clock restarted."""
+                exp(-((t-h_rel)/24h)^2) — same FHLO shape, clock restarted."""
                 def dydt(self, t, y):
                     d = super().dydt(t, y)
                     lead_h = (float(t) / 3600.0) - h_rel
-                    d[2] += (F_rel / 3600.0) * np.exp(-2.0 * (lead_h / 24.0) ** 2)
+                    d[2] += (F_rel / 3600.0) * np.exp(-(lead_h / 24.0) ** 2)
                     return d
             rfast = ReleasedFast(env_provider=PrecomputedEnv(), track_provider=BTTrack(),
                                  h_bl=1000.0)
@@ -599,12 +600,12 @@ def main():
                    help='Disable FHLO Karhunen-Loeve initial-intensity perturbation.')
     p.add_argument('--no_forcing', action='store_true',
                    help='init_mode=fhlo keeps 48h replay + KL init but drops the '
-                        'forecast-phase F_init*exp(-2(t/24)^2) forcing term '
+                        'forecast-phase F_init*exp(-(t/24)^2) forcing term '
                         '(free-physics forecast from the replayed initial state).')
     p.add_argument('--replay_until_h', type=float, default=None,
                    help='Glue V to obs over the FIRST N hours of the forecast window '
                         '(e.g. hours from orig init to the 60kt node), accumulate the '
-                        'physics residual, then release with F*exp(-2((t-N)/24h)^2).')
+                        'physics residual, then release with F*exp(-((t-N)/24h)^2).')
     p.add_argument('--init_mode', choices=['fhlo', 'free'], default='fhlo',
                    help="'fhlo' = 48h replay + KL history perturbation + forcing decay "
                         "(strict FHLO); 'free' = old behavior (t=0 KL only, no forcing).")
@@ -695,7 +696,7 @@ def _write_nc(res, names, n, obs, lat_all, lon_all, args, ref_time_str=''):
                          'env: v_pot from prepared scalars, h_m/t_strat/bathy from '
                          'climatology, chi/S injected. init_mode=fhlo: 48h replay + '
                          'KL(n=10, piecewise sigma^2_y) history perturbation + '
-                         'forcing decay exp(-2(t/24h)^2); free: no forcing.')
+                         'forcing decay exp(-(t/24h)^2); free: no forcing.')
     out.attrs['vent_scale'] = float(args.vent_scale)
     out.attrs['vp_scale'] = float(args.vp_scale)
     out.attrs['kl_perturb'] = int(bool(not args.no_kl_perturb))

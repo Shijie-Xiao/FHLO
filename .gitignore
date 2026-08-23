@@ -7,3 +7,4 @@ __pycache__/
 # Data & download scripts (not synced)
 data/
 download/
+logs/

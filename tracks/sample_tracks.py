@@ -123,20 +123,31 @@ def sample_for_storm(storm_dir: Path, storm_name: str,
     init_time = data.get("reference_time")
     storm_name = cfg.get("storm_name", storm_name) if cfg else storm_name
     dt_hours = float(mp.get("dt_hours", 6.0))
+    glob, step_params = None, None
 
-    if "step_params" not in mp or not mp["step_params"]:
-        print(f"  [SKIP] {storm_name}: step_params missing")
-        return None
-
-    step_params = {
-        int(k): {
-            "mu_old": np.array(v["mu_old"]),
-            "mu_new": np.array(v["mu_new"]),
-            "A": np.array(v["A"]),
-            "Sigma_cond": np.array(v["Sigma_cond"]),
+    if mp.get("fit_mode") == "global" and "A" in mp:
+        # Paper-faithful stationary chain: one global joint Gaussian
+        # (Lin et al. 2020 section 3a); A / Sigma_cond constant in time.
+        glob = {
+            "mu_old": np.array(mp["mu_old"]),
+            "mu_new": np.array(mp["mu_new"]),
+            "A": np.array(mp["A"]),
+            "Sigma_cond": np.array(mp["Sigma_cond"]),
         }
-        for k, v in mp["step_params"].items()
-    }
+    elif "step_params" in mp and mp["step_params"]:
+        # Legacy per-step fits (old pkl files)
+        step_params = {
+            int(k): {
+                "mu_old": np.array(v["mu_old"]),
+                "mu_new": np.array(v["mu_new"]),
+                "A": np.array(v["A"]),
+                "Sigma_cond": np.array(v["Sigma_cond"]),
+            }
+            for k, v in mp["step_params"].items()
+        }
+    else:
+        print(f"  [SKIP] {storm_name}: no usable markov params")
+        return None
 
     init_cloud = _load_init_cloud(storm_dir)
     mu_old = np.array(mp["mu_old"])
@@ -181,10 +192,11 @@ def sample_for_storm(storm_dir: Path, storm_name: str,
             u_init_arr = u_seeds[idx]
             v_init_arr = v_seeds[idx]
 
-    # Cap requested length to the trained reliable horizon (no extrapolation,
-    # which would cause runaway random-walk to non-physical lat/lon).
-    max_reliable_step = int(mp.get("max_reliable_step", max(step_params.keys())))
-    max_reliable_step = min(max_reliable_step, max(step_params.keys()))
+    # Cap requested length to the trained reliable horizon (paper 75% rule:
+    # >=75% of members must survive; no sampling beyond it).
+    max_reliable_step = int(mp.get("max_reliable_step", 0))
+    if step_params:
+        max_reliable_step = min(max_reliable_step, max(step_params.keys()))
     n_steps_req = int(duration_days * 24 / dt_hours) + 1
     n_steps = min(n_steps_req, max_reliable_step + 1)
     dt_seconds = dt_hours * 3600.0
@@ -203,11 +215,14 @@ def sample_for_storm(storm_dir: Path, storm_name: str,
         v[:, 0] = uv0[:, 1]
 
     for i in range(1, n_steps):
-        sp = step_params.get(i)
-        if not sp:
-            # within reliable horizon a step may still be missing -> nearest lower
-            avail = [k for k in step_params if k <= i]
-            sp = step_params[max(avail)] if avail else step_params[min(step_params)]
+        if glob is not None:
+            sp = glob                       # stationary global parameters
+        else:
+            sp = step_params.get(i)
+            if not sp:
+                # within reliable horizon a step may still be missing -> nearest lower
+                avail = [k for k in step_params if k <= i]
+                sp = step_params[max(avail)] if avail else step_params[min(step_params)]
         prev_vec = np.stack([u[:, i - 1], v[:, i - 1]], axis=1)
         mean_cond = sp["mu_new"] + (sp["A"] @ (prev_vec - sp["mu_old"]).T).T
         curr = mean_cond + rng.multivariate_normal(

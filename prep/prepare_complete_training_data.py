@@ -19,11 +19,16 @@ from scipy.interpolate import CubicSpline, PchipInterpolator
 warnings.filterwarnings('ignore')
 
 THIS_DIR = Path(__file__).resolve().parent
-PRECALC_DIR = THIS_DIR / 'precalc_data'
+PROJECT_ROOT = THIS_DIR.parent
+PRECALC_DIR = PROJECT_ROOT / 'precalc_data'
 
-# All dependencies are local to FAST_ML (self-contained for GitHub).
-sys.path.insert(0, str(THIS_DIR))
-sys.path.insert(0, str(THIS_DIR / 'vortex_inversion'))
+# All dependencies are local to FHLO (self-contained for GitHub).
+# NOTE: only add common/ (so 'util' resolves to the util/ package) and
+# common/vortex_inversion (for 'import sphere'); never common/util itself --
+# common/util/util.py would shadow the util package.
+sys.path.insert(0, str(PROJECT_ROOT / 'common'))
+sys.path.insert(0, str(PROJECT_ROOT / 'common' / 'thermo_table'))
+sys.path.insert(0, str(PROJECT_ROOT / 'common' / 'vortex_inversion'))
 
 import namelist
 if not hasattr(namelist, 'select_thermo'):
@@ -32,7 +37,12 @@ if not hasattr(namelist, 'p_midlevel'):
     namelist.p_midlevel = 60000
 sys.modules.setdefault('namelist', namelist)
 
-from thermo import thermo
+# thermo.py in FHLO is a module of functions (not a class instance like PINN).
+# Expose it under the legacy 'thermo.thermo' import path used by calc_chi.
+import thermo as _thermo_mod
+sys.modules.setdefault('thermo.thermo', _thermo_mod)
+thermo = _thermo_mod
+
 from vortex_lib import VORTEX_LIB
 
 # ---------- Constants ----------
@@ -59,6 +69,16 @@ CHI_PARAMS = {
 }
 
 ERA5_ROOT = '/global/cfs/cdirs/m5011/Jay/ERA5'
+# Local flat layout shipped with the repo (data/ is gitignored):
+#   data/era5/{T,Q,U,V}_{YYYYMMDD}.nc   (daily PL, 30 levels, REGIONAL crop)
+#   data/era5/{SSTK,MSL,BLH}_{YYYYMM}.nc (monthly SFC, REGIONAL crop)
+# NOTE: local data is time-cropped with the FULL spatial domain kept
+# (lat 0-80N, lon 0-360E), produced by download/crop_beryl_sample.py.
+# The pipeline reads ONLY local data (demo-shippable); the CFS archive is
+# used exclusively by the crop script.
+LOCAL_ERA5_ROOT = PROJECT_ROOT / 'data' / 'era5'
+LOCAL_OISST_ROOT = PROJECT_ROOT / 'data' / 'oisst'
+CFS_ERA5_ROOT = Path(ERA5_ROOT)
 SUPPORTED_BASINS = ('NA', 'EP')
 TIME_TOLERANCE = pd.Timedelta(minutes=30)
 
@@ -71,7 +91,9 @@ SFC_VAR_CODE = {'SSTK': '034_sstk', 'MSL': '151_msl'}
 # ---------- Config ----------
 def load_config(path: Path):
     cfg = {'basins': 'ALL', 'year_start': '2003', 'year_end': '2024',
-           'output_dir': 'data', 'era5_root': ERA5_ROOT}
+           'output_dir': 'data/ibtracs', 'era5_root': '',
+           'sst_source': 'ERA5', 'env_source': 'ERA5', 'track_source': 'ECMWF',
+           'oisst_dir': str(LOCAL_OISST_ROOT), 'n_workers': '4'}
     if path.exists():
         for line in path.read_text(encoding='utf-8').splitlines():
             s = line.strip()
@@ -97,15 +119,29 @@ def infer_basin(track_csv_path=None, hurricane_name=None):
 
 
 def get_era5_config(basin='NA', era5_root=None):
-    root = era5_root or ERA5_ROOT
+    # The pipeline reads ONLY local time-cropped data (data/era5) by default,
+    # so the demo is self-contained. era5_root override is for power users.
+    if era5_root is not None:
+        root = era5_root
+    else:
+        root = str(LOCAL_ERA5_ROOT)
     basin_upper = (basin or 'NA').upper()
     basin_root = os.path.join(root, basin_upper)
-    # Support both layouts: old (ERA5/{NA|EP}/{VAR}/) and new (ERA5/Test/PL|SFC/)
+    # Layout detection (checked in order):
+    #   1. New:   ERA5/PL/ + ERA5/SFC/
+    #   2. Local flat: data/era5/{T,Q,U,V}_{YYYYMMDD}.nc directly in root
+    #   3. Old:   ERA5/{NA|EP}/{VAR}/   (CFS archive: global 0-80N, 0-360)
     if os.path.isdir(os.path.join(root, 'PL')):
         return {
             'basin': basin_upper,
             'pl_root': os.path.join(root, 'PL'),
             'sfc_root': os.path.join(root, 'SFC'),
+        }
+    if glob.glob(os.path.join(root, 'T_*.nc')) or glob.glob(os.path.join(root, 'SSTK_*.nc')):
+        return {
+            'basin': basin_upper,
+            'pl_root': root,
+            'sfc_root': root,
         }
     return {
         'basin': basin_upper,
@@ -187,10 +223,14 @@ def _open_sfc(ts, cache, cfg):
         msl_p = _first_glob(os.path.join(sfc_root, 'MSL', f'*MSL*{ym}*.nc')) or \
                 _first_glob(os.path.join(sfc_root, 'MSL', f'*msl*{ym}*.nc'))
     else:
-        # Flat layout: monthly files directly in SFC/ (e.g. ERA5/2025/SFC/*.nc)
+        # Flat layouts: monthly files directly in SFC/ -- either
+        #   data/era5/{SSTK,MSL,BLH}_{YYYYMM}.nc  (local repo layout), or
+        #   ERA5/2025/SFC/*034_sstk*{ym}*.nc      (CFS flat layout)
         flat = True
-        sst_p = _first_glob(os.path.join(sfc_root, f'*{SFC_VAR_CODE["SSTK"]}*{ym}*.nc'))
-        msl_p = _first_glob(os.path.join(sfc_root, f'*{SFC_VAR_CODE["MSL"]}*{ym}*.nc'))
+        sst_p = _first_glob(os.path.join(sfc_root, f'SSTK_{ym}.nc')) or \
+                _first_glob(os.path.join(sfc_root, f'*{SFC_VAR_CODE["SSTK"]}*{ym}*.nc'))
+        msl_p = _first_glob(os.path.join(sfc_root, f'MSL_{ym}.nc')) or \
+                _first_glob(os.path.join(sfc_root, f'*{SFC_VAR_CODE["MSL"]}*{ym}*.nc'))
     if not sst_p or not msl_p:
         cache[k] = None
         return None
@@ -199,7 +239,8 @@ def _open_sfc(ts, cache, cfg):
     if os.path.isdir(sfc_dir):
         blh_p = _first_glob(os.path.join(sfc_dir, f'*159_blh*{ym}*.nc'))
     elif flat:
-        blh_p = _first_glob(os.path.join(sfc_root, f'*159_blh*{ym}*.nc'))
+        blh_p = _first_glob(os.path.join(sfc_root, f'BLH_{ym}.nc')) or \
+                _first_glob(os.path.join(sfc_root, f'*159_blh*{ym}*.nc'))
     else:
         blh_p = _first_glob(os.path.join(sfc_root, 'BLH', f'*BLH*{ym}*.nc'))
     if blh_p:
@@ -241,6 +282,10 @@ def _level_key(da):
 
 def _find_pl(var, date_str, cfg):
     ym = date_str[:6]
+    # Local flat layout first: data/era5/{T,Q,U,V}_{YYYYMMDD}.nc (daily, 30 lev)
+    local_p = os.path.join(cfg['pl_root'], f'{var}_{date_str}.nc')
+    if os.path.exists(local_p):
+        return local_p
     # New layout: PL/{YYYYMM}/*.128_{code}*.nc
     pl_dir = os.path.join(cfg['pl_root'], ym)
     if os.path.isdir(pl_dir):
@@ -300,6 +345,37 @@ def close_caches(sfc_cache, pl_cache):
                 if d is not None:
                     try: d.close()
                     except Exception: pass
+
+
+# ---------- OISST (GHRSST) ----------
+def _open_oisst(ts, cache, oisst_dir=None):
+    """Open the daily OISST file nearest to ts. Returns {'ds': Dataset} or None."""
+    root = Path(oisst_dir or LOCAL_OISST_ROOT)
+    k = ts.strftime('%Y%m%d')
+    if k in cache:
+        return cache[k]
+    f = root / f'{k}.nc'
+    cache[k] = {'ds': xr.open_dataset(f)} if f.exists() else None
+    return cache[k]
+
+
+def _sst_oisst_at(ts, lat, lon, cache, oisst_dir=None):
+    """SST [K] at (lat, lon) from OISST daily file; nearest-date fallback +-1d."""
+    for off in (0, 1, -1, 2, -2):
+        e = _open_oisst(ts + pd.Timedelta(days=off), cache, oisst_dir)
+        if e and e.get('ds') is not None:
+            ds = e['ds']
+            lk = 'latitude' if 'latitude' in ds.coords else 'lat'
+            nk = 'longitude' if 'longitude' in ds.coords else 'lon'
+            lons = ds[nk].values
+            ln = lon + 360 if (np.min(lons) >= 0 and lon < 0) else lon
+            try:
+                v = float(ds['sst'].sel({lk: lat, nk: ln}, method='nearest').values)
+            except Exception:
+                continue
+            if np.isfinite(v):
+                return v + K_TO_C if v < 200 else v
+    return np.nan
 
 
 # ---------- Distance masks ----------
@@ -391,11 +467,14 @@ def get_env_wnds_annulus(u_d, v_d, lat, lon, lk, latk, lonk, rmin=200, rmax=800)
     return u250, v250, u850, v850
 
 
-def get_env_wnds(u_d, v_d, lat, lon, lk, latk, lonk):
-    """Env winds via annulus ring-average (matches ODE/training convention).
-    NOTE: switched from vortex_surgery to annulus -- surgery gave a different
-    (noisier/inflated) shear convention than the annulus-trained model expects."""
-    return get_env_wnds_annulus(u_d, v_d, lat, lon, lk, latk, lonk)
+def get_env_wnds(u_d, v_d, lat, lon, lk, latk, lonk, box=25):
+    """Env winds via vortex_lib vortex surgery (strict, per ODE convention).
+
+    Extracts a 25x25-deg box around the storm, removes the vortex with
+    VORTEX_LIB.vortex_surgery, and takes the filtered wind at the storm
+    center. This matches the ODE/training prep exactly.
+    """
+    return get_env_wnds_vortex(u_d, v_d, lat, lon, lk, latk, lonk, box=box)
 
 
 # ---------- Translational speed ----------
@@ -684,15 +763,23 @@ class _Abort(Exception):
     pass
 
 
-def process_one_storm(track_csv, era5_root_override=None):
+def process_one_storm(track_csv, era5_root_override=None, sst_source='ERA5',
+                      oisst_dir=None):
     track_csv = Path(track_csv)
     track_name = track_csv.parent.name
     basin = infer_basin(track_csv_path=str(track_csv), hurricane_name=track_name)
     era5_cfg = get_era5_config(basin, era5_root=era5_root_override)
+    oisst_cache = {}
     df6 = read_track_6h(track_csv)
     if len(df6) < 2:
         return None
     df, idx_6h = interpolate_to_1h(df6)
+    # Persist the 1h interpolated track next to the 6h source (reusable).
+    f1 = track_csv.parent / 'track_intensity_1h.csv'
+    try:
+        df.round(4).to_csv(f1, index=False)
+    except Exception:
+        pass
     utran_all, vtran_all = calc_utran_vtran(df['lon'].values, df['lat'].values, df['time'].values)
     u_trans = calc_translation_speed(df['lat'].values, df['lon'].values, df['time'].values)
     use_360 = True
@@ -743,22 +830,28 @@ def process_one_storm(track_csv, era5_root_override=None):
         v_ms = row['vmax_ms']
 
         try:
-            # SST (24h lag)
+            # SST (24h lag) -- source-switchable: ERA5 SSTK or OISST daily
             t_lag = t_curr - pd.Timedelta(hours=24)
             sfc_lag = _open_sfc(t_lag, sfc_cache, era5_cfg)
             sfc_curr = _open_sfc(t_curr, sfc_cache, era5_cfg)
-            if not sfc_lag or not sfc_lag.get('ds'):
-                raise _Abort("SST missing")
-            sst_s = _sel_time(sfc_lag['ds'], t_lag)
-            if sst_s is None:
-                raise _Abort("SST time mismatch")
-            sst_var = next((v for v in sst_s.data_vars if 'sst' in v.lower()), None)
-            if not sst_var:
-                raise _Abort("no SST var")
-            lk = 'latitude' if 'latitude' in sst_s.coords else 'lat'
-            nk = 'longitude' if 'longitude' in sst_s.coords else 'lon'
-            sst_raw = float(sst_s[sst_var].sel({lk: qlat, nk: _norm_lon(qlon, sst_s[nk].values)}, method='nearest').values)
-            sst_k = K_TO_C if np.isnan(sst_raw) else (float(sst_raw) + K_TO_C if sst_raw < 200 else float(sst_raw))
+            if sst_source.upper() == 'OISST':
+                sst_raw = _sst_oisst_at(t_lag, qlat, qlon, oisst_cache, oisst_dir)
+                sst_k = sst_raw  # already Kelvin, NaN propagates
+                if np.isnan(sst_k):
+                    raise _Abort("OISST missing")
+            else:
+                if not sfc_lag or not sfc_lag.get('ds'):
+                    raise _Abort("SST missing")
+                sst_s = _sel_time(sfc_lag['ds'], t_lag)
+                if sst_s is None:
+                    raise _Abort("SST time mismatch")
+                sst_var = next((v for v in sst_s.data_vars if 'sst' in v.lower()), None)
+                if not sst_var:
+                    raise _Abort("no SST var")
+                lk = 'latitude' if 'latitude' in sst_s.coords else 'lat'
+                nk = 'longitude' if 'longitude' in sst_s.coords else 'lon'
+                sst_raw = float(sst_s[sst_var].sel({lk: qlat, nk: _norm_lon(qlon, sst_s[nk].values)}, method='nearest').values)
+                sst_k = K_TO_C if np.isnan(sst_raw) else (float(sst_raw) + K_TO_C if sst_raw < 200 else float(sst_raw))
 
             # MSL
             if not sfc_curr or not sfc_curr.get('ds'):
@@ -769,6 +862,8 @@ def process_one_storm(track_csv, era5_root_override=None):
             msl_var = next((v for v in msl_s.data_vars if 'msl' in v.lower() or 'sp' in v.lower()), None)
             if not msl_var:
                 raise _Abort("no MSL var")
+            lk = 'latitude' if 'latitude' in msl_s.coords else 'lat'
+            nk = 'longitude' if 'longitude' in msl_s.coords else 'lon'
             msl_pa = float(msl_s[msl_var].sel({lk: qlat, nk: _norm_lon(qlon, msl_s[nk].values)}, method='nearest').values)
             if msl_pa < 2000:
                 msl_pa *= 100.0
@@ -914,6 +1009,7 @@ def process_one_storm(track_csv, era5_root_override=None):
 
     return {
         'hurricane': track_name,
+        'sst_source': str(sst_source).upper(),
         'spatial_3d': np.array(out['spatial_3d'], dtype=np.float32)[np.newaxis],
         'spatial_2d': np.array(out['spatial_2d'], dtype=np.float32)[np.newaxis],
         'scalars': np.array(out['scalars'], dtype=np.float32)[np.newaxis],
@@ -943,13 +1039,17 @@ def main():
     p.add_argument('--basins', default='')
     p.add_argument('--year_start', type=int, default=0)
     p.add_argument('--year_end', type=int, default=0)
+    p.add_argument('--sst_source', default='', help='ERA5 | OISST')
+    p.add_argument('--oisst_dir', default='')
     p.add_argument('--overwrite', action='store_true')
     p.add_argument('--limit', type=int, default=0)
     args = p.parse_args()
 
     cfg = load_config(Path(args.config))
     data_root = args.data_root or cfg['output_dir']
-    era5 = args.era5_root or cfg.get('era5_root', ERA5_ROOT)
+    era5 = args.era5_root or cfg.get('era5_root', '')
+    sst_source = args.sst_source or cfg.get('sst_source', 'ERA5')
+    oisst_dir = args.oisst_dir or cfg.get('oisst_dir', '')
     basins = parse_basins(args.basins or cfg['basins'])
     y0 = args.year_start if args.year_start > 0 else int(cfg['year_start'])
     y1 = args.year_end if args.year_end > 0 else int(cfg['year_end'])
@@ -957,7 +1057,8 @@ def main():
     tracks = discover_tracks(data_root, basins, y0, y1)
     if args.limit > 0:
         tracks = tracks[:args.limit]
-    print(f"Found {len(tracks)} storms for basins={basins} years={y0}-{y1}")
+    print(f"Found {len(tracks)} storms for basins={basins} years={y0}-{y1} "
+          f"(sst={sst_source})")
 
     ok, fail = 0, 0
     for basin, year, csv_path in tracks:
@@ -967,7 +1068,9 @@ def main():
             print(f"[Skip] {basin} {year} {storm_dir.name}")
             continue
         try:
-            ds = process_one_storm(csv_path, era5_root_override=era5)
+            ds = process_one_storm(csv_path, era5_root_override=era5 or None,
+                                   sst_source=sst_source,
+                                   oisst_dir=oisst_dir or None)
             if ds is None:
                 fail += 1
                 continue

@@ -107,7 +107,8 @@ def run_fast_physics_torch_training(pred_chi, pred_s, x_scalars, v_init, env_wnd
       - 逐样本从 t_start[b] 开始自由积分，完全对齐 run_fast_reference 逻辑：
         * V_init[b] = v_axisym_at_tstart[b]（precompute 48h nudging 后的轴对称风速）
         * m_init[b] = m_at_tstart（由外部 m_init 传入，48h spin-up 结束时的 m）
-        * dV_extra(t) = F_init_end × exp(-2×((t-t_start)/24h)²)，仅预报期施加
+        * dV_extra(t) = F_init_end × exp(-((t-t_start)/24h)²)，仅预报期施加
+                       （论文形式 exp[-(t/t0)^2], t0=1 day; 旧版 exp(-2·) 已弃用）
         * v_fast[b, t<t_start]=0（被 _vm(use_tstart=True) 排除出 loss）
         * v_fast[b, t>=t_start] 对应物理时刻 t，与 v_gt[b,t] 对齐
     当 v_axisym_at_tstart 为 None 时（兼容模式）：
@@ -167,7 +168,7 @@ def run_fast_physics_torch_training(pred_chi, pred_s, x_scalars, v_init, env_wnd
                 vp_t       = vp[b, t]
                 is_ocean_t = is_ocean[b, t]
                 lead_h     = float(t - ts_b)
-                decay      = torch.exp(torch.tensor(-2.0 * (lead_h / T0_DECAY_HOURS) ** 2,
+                decay      = torch.exp(torch.tensor(-1.0 * (lead_h / T0_DECAY_HOURS) ** 2,
                                                     device=dev, dtype=pred_chi.dtype))
                 dV_extra   = fie_b * decay
                 for _ in range(4):
@@ -212,7 +213,7 @@ def run_fast_physics_torch_training(pred_chi, pred_s, x_scalars, v_init, env_wnd
         if fie is not None:
             is_forecast = (t >= ts_arr).float()
             lead_h = (t - ts_arr).float().clamp(min=0.0)
-            dV_extra = fie * torch.exp(-2.0 * (lead_h / T0_DECAY_HOURS) ** 2) * is_forecast
+            dV_extra = fie * torch.exp(-1.0 * (lead_h / T0_DECAY_HOURS) ** 2) * is_forecast
         else:
             dV_extra = torch.zeros(B, device=dev, dtype=pred_chi.dtype)
         for _ in range(4):
@@ -430,7 +431,7 @@ def run_fast_physics_torch_inference(pred_chi, pred_s, x_scalars, precomp, env_w
                 V = Vtar_next
             else:
                 lead_h = t - ts
-                decay_val = -2.0 * (lead_h / T0_DECAY_HOURS) ** 2
+                decay_val = -1.0 * (lead_h / T0_DECAY_HOURS) ** 2
                 decay = torch.exp(torch.tensor(decay_val, device=V.device, dtype=V.dtype))
                 dV_extra = (F_init_end[i] * decay).unsqueeze(0)
                 is_ocean_1 = is_ocean_t.unsqueeze(0)

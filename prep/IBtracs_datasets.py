@@ -88,11 +88,15 @@ def safe_name(name):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--config", default="config.txt")
+    p.add_argument("--config", default=str(Path(__file__).resolve().parent.parent / "config.txt"))
     args = p.parse_args()
     c = load_config(Path(args.config))
 
+    # Resolve output_dir relative to the project root (parent of prep/)
+    proj_root = Path(__file__).resolve().parent.parent
     out_root = Path(c["output_dir"])
+    if not out_root.is_absolute():
+        out_root = proj_root / out_root
     if c["clear_first"] and out_root.exists():
         shutil.rmtree(out_root)
     out_root.mkdir(parents=True, exist_ok=True)

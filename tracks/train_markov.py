@@ -44,13 +44,21 @@ def _fit_gaussian(velocity_pairs: np.ndarray):
 
 def _fit_per_step(step_indices: np.ndarray, velocity_pairs: np.ndarray,
                   min_samples: int = 5):
-    """Fit per-step Gaussian for each unique step index."""
+    """Fit per-step Gaussian for each unique step index (legacy, unused)."""
     step_params = {}
     for s in np.unique(step_indices):
         pairs_s = velocity_pairs[step_indices == s]
         if len(pairs_s) >= min_samples:
             step_params[int(s)] = _fit_gaussian(pairs_s)
     return step_params
+
+
+def _fit_global(velocity_pairs: np.ndarray):
+    """FHLO paper-faithful fit: ONE global joint Gaussian for
+    P(u_{t-1}, v_{t-1}, u_t, v_t) built from ALL ensemble-member
+    displacements (Lin et al. 2020, section 3a: a single k=1 mixture
+    component; stationary Markov chain)."""
+    return _fit_gaussian(velocity_pairs)
 
 
 def run_train_markov():
@@ -81,17 +89,16 @@ def run_train_markov():
             continue
 
         storm_name = cfg.get("storm_name", storm_dir.name)
-        step_params = _fit_per_step(step_indices, velocity_pairs)
-        if not step_params:
-            continue
-
-        first_step = min(step_params.keys())
+        fit = _fit_global(velocity_pairs)
         params = {
-            "mu_old": step_params[first_step]["mu_old"],
-            "Sigma_oo": step_params[first_step]["Sigma_oo"],
+            "mu_old": fit["mu_old"],
+            "mu_new": fit["mu_new"],
+            "Sigma_oo": fit["Sigma_oo"],
+            "A": fit["A"],
+            "Sigma_cond": fit["Sigma_cond"],
             "dt_hours": dt_hours,
             "reference_time": ref_time,
-            "step_params": step_params,
+            "fit_mode": "global",
             "max_reliable_step": int(step_indices.max()),
         }
 
@@ -108,7 +115,7 @@ def run_train_markov():
                 "reference_time": ref_time,
             }, f)
         print(f"  {storm_name}: {len(velocity_pairs)} pairs, "
-              f"{len(step_params)} steps")
+              f"global fit, horizon {int(step_indices.max()) * 6}h")
 
 
 if __name__ == "__main__":
