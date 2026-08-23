@@ -10,12 +10,12 @@ Three pipelines share one codebase:
 1. **Deterministic reference** — IBTrACS best track → 1 h interpolation →
    ERA5/OISST environment extraction (vortex surgery) → FAST ODE
    (`run.py`, one command).
-2. **Synthetic track ensembles** — parent ensemble tracks (ECMWF TIGGE XML /
-   GEFS GRIB2 vortex tracking) → Markov chain on translational velocity →
-   1000-member sampling (`tracks/batch_generate.py`).
+2. **Synthetic track ensembles** — parent ensemble tracks (ECMWF TIGGE XML)
+   → Markov chain on translational velocity → 1000-member sampling with
+   member-paired bootstrap (`tracks/batch_generate.py`).
 3. **Full 1000-member ensemble forecast** — synthetic tracks × GEFS forecast
-   environment fields → per-member FAST ODE with FHLO initialization
-   (48 h replay + KL intensity perturbation) (`ensemble/`).
+   environment fields (member-paired or round-robin) → per-member FAST ODE
+   (`run.py --ensemble`).
 
 ---
 
@@ -23,7 +23,8 @@ Three pipelines share one codebase:
 
 ```
 FHLO/
-├── run.py / run.slurm / config.txt      # deterministic pipeline entry + config
+├── run.py / run.slurm / config.txt      # pipeline entries + config
+│                                        #   (deterministic AND ensemble modes)
 ├── prep/                                # data preparation
 │   ├── IBtracs_datasets.py              #   IBTrACS download -> 6h best-track CSV
 │   ├── prepare_complete_training_data.py#   1h interp + env extraction -> dataset.pkl
@@ -35,15 +36,12 @@ FHLO/
 │   └── constants.py / utils.py
 ├── tracks/                              # synthetic-track module (see tracks/README.md)
 │   ├── batch_generate.py                #   THE entry: read->pairs->fit->sample->plot
-│   ├── read_files.py / build_pairs.py   #   TIGGE XML / GEFS -> 6h velocity pairs
-│   ├── train_markov.py / sample_tracks.py
-│   └── config.py / plot_tracks.py / gefs_tracks.py
-├── ensemble/                            # 1000-member forecast pipeline
-│   ├── gefs_ens_adapter.py              #   GEFS GRIB2 -> ERA5-equivalent fields
-│   ├── run_prep_gefs_ens1000.py         #   (track × GEFS member) -> dataset.pkl
-│   ├── run_prep_div1000.py              #   (synthetic track × ERA5) -> dataset.pkl
-│   ├── predict_chi_s_div1000.py         #   ML chi/s extraction (optional stage)
-│   └── run_ode_from_chis.py             #   per-member FAST ODE -> ensemble NC
+│   ├── read_files.py / build_pairs.py   #   TIGGE XML -> 6h velocity pairs
+│   ├── train_markov.py / sample_tracks.py  # per-step Gaussian fit + member-paired sampling
+│   └── config.py / plot_tracks.py
+├── ensemble/                            # ensemble env adapter (consumed by run.py)
+│   └── gefs_nc_adapter.py               #   GEFS local nc -> env fields (a+b merge,
+│                                         #   MSL+skt SST, native 0.5-deg, fhour cache)
 ├── common/                              # shared libraries
 │   ├── thermo_table/                    #   entropy-table thermodynamics (χ)
 │   ├── vortex_inversion/                #   vortex surgery (pyamg + pyshtools)
@@ -200,80 +198,58 @@ Details and paper-conformance table: `tracks/README.md`.
 
 ---
 
-## Pipeline 3 — Full 1000-member ensemble forecast (`ensemble/`)
+## Pipeline 3 — Full 1000-member ensemble forecast (`run.py --ensemble`)
 
-Two environment backends, same downstream ODE:
-
-**(a) GEFS forecast fields** (`run_prep_gefs_ens1000.py`) — the forecast
-configuration: each synthetic track is paired with a GEFS ensemble member
-(c00, p01–p30) and the environment along the track is read from that member's
-GRIB2 forecast via `gefs_ens_adapter.py` (0.5°→0.25° regrid, pgrb2a+b level
-merge; BLH absent → 1400 m fallback).
-
-**(b) ERA5 analysis fields** (`run_prep_div1000.py`) — fully-divergent mode:
-`init_time = reference_time`, no best-track prepend, members diverge from h=0.
+One command drives the whole chain: synthetic tracks (Pipeline 2) are spliced
+hourly with the best-track intensity, each track is assigned a GEFS ensemble
+member's forecast environment, prep extracts per-member scalars with strict
+vortex surgery, and the FAST ODE produces per-member V(t) — all in a process
+pool.
 
 ```
 synthetic_tracks_1000members.nc ──┐
- (Pipeline 2 output)              │  prep/prepare_ensemble_storm.py
- best-track dataset.pkl ──────────┤  (hourly splice; vmax from best track)
-                                  ▼
-                    {OUT_ROOT}/{HID}_M{NNN}/{HID}_M{NNN}_dataset.pkl   ×1000
-                                  │
-              ┌───────────────────┴───────────────────┐
-              ▼                                       ▼
-   ensemble/predict_chi_s_div1000.py        ensemble/run_ode_from_chis.py
-   (ML TwoStream χ/S extraction;             (FAST ODE per member:
-    optional — FAST path reads                48h replay + KL(n=10) intensity
-    physics χ from the pkl directly)          perturbation, F·exp[-(t/24h)²])
-              │                                       │
-              └────────────► chi_s.nc ◄───────────────┘
-                                                  │
-                                                  ▼
-                                        ensemble ODE output NC
-                              (V(t) per member; ensemble stats downstream)
+ (Pipeline 2 output, with          │  prep/prepare_ensemble_storm.py
+  parent_track)                    │  (hourly splice; vmax from best track)
+ best-track dataset.pkl ──────────┤
+                                   ▼
+        run.py --ensemble (stage eprep)
+          resolve_member_assignment():
+            ecmwf       parent_track[i] % 31  (51 ECMWF parents -> 31 GEFS members)
+            gefs        parent GEFS code directly (self-consistent)
+            round_robin i % 31
+          ensemble/gefs_nc_adapter.py (pgrb2a+b level merge, MSL + skt SST,
+            native 0.5-deg grid, fhour cache, vortex surgery incl. edge
+            degradation)  ->  {OUT}/{STORM}_M{NNN}/{STORM}_M{NNN}_dataset.pkl
+                                   │
+        run.py --ensemble (stage ode)
+          physics/run_fast_reference.py per member
+            -> fast_reference.csv / fast_reference.png + ensemble summary
 ```
 
 ```bash
-# (a) GEFS-driven prep: 1000 members, track×member parent-paired
-GEFS_CASE_DIR=/global/cfs/cdirs/m5011/Jay/ERA5/GFS/2025_ERIN_NA \
-GEFS_INIT_TIME='2025-08-11 12:00' \
-PREP_SYNTH_NC=tracks/processed/erin_2025/2025081112/synthetic_tracks_1000members.nc \
-PREP_BEST_TRACK=data/ibtracs/NA/2025/2025223N17337_ERIN/2025223N17337_ERIN_dataset.pkl \
-PREP_OUT_ROOT=data/ensemble/erin_gefs_1000 \
-PREP_N_MEMBERS=1000 PREP_WORKERS=32 \
-python ensemble/run_prep_gefs_ens1000.py
+# quick test: 5 members
+python run.py --ensemble \
+    --synth-nc tracks/processed/beryl_2024/2024062900/synthetic_tracks_1000members.nc \
+    --members 5 --assign ecmwf --workers 5
 
-# (b) ERA5 fully-divergent prep
-PREP_SYNTH_NC=tracks/processed/irma_2017/2017090500/synthetic_tracks_1000members.nc \
-PREP_BEST_TRACK=data/ibtracs/NA/2017/2017242N16333_IRMA/2017242N16333_IRMA_dataset.pkl \
-PREP_OUT_ROOT=data/ensemble/irma_div1000 \
-PREP_REF_TIME='2017-09-05 00:00' PREP_DURATION_H=264 \
-python ensemble/run_prep_div1000.py
+# full 1000-member run (slurm: run.slurm passes args through)
+python run.py --ensemble \
+    --synth-nc tracks/processed/beryl_2024/2024062900/synthetic_tracks_1000members.nc \
+    --members 1000 --assign ecmwf --workers 32
 
-# ODE ensemble (FAST physics χ; KL perturbation on; F forcing on)
-python ensemble/run_ode_from_chis.py \
-    --in_nc  data/ensemble/irma_div1000/irma_chi_s.nc \
-    --out_nc data/ensemble/irma_div1000/irma_ode.nc \
-    --bt_pkl data/ibtracs/NA/2017/2017242N16333_IRMA/2017242N16333_IRMA_dataset.pkl \
-    --modes fast --workers 32
-
-# useful ODE flags
-#   --init_mode fhlo|free      fhlo = 48h replay + KL; free = t=0 KL only
-#   --no_kl_perturb            disable the KL intensity perturbation
-#   --no_forcing               free physics after replay (F diagnostic only)
-#   --replay_until_h H         glue V to obs through hour H, then release
-#   --vent_scale / --vp_scale  ventilation / v_pot tuning
-#   --env_mode era5 --era5_dir DIR   live ERA5EnvProvider (exact reproduction)
+# key flags
+#   --assign ecmwf|gefs|round_robin   env-member assignment mode
+#   --gefs-init / --gefs-dir          GEFS forecast init / local nc dir
+#                                     (defaults from config.txt)
+#   --members N                       subset for testing
+#   --duration-h H                    per-member forecast length (default 240)
+#   --out-root DIR                    default data/ensemble/beryl_gefs_1000
 ```
 
-Environment variables (`run_prep_*.py`): `PREP_SYNTH_NC`, `PREP_BEST_TRACK`,
-`PREP_OUT_ROOT`, `PREP_HID`, `PREP_YEAR`, `PREP_REF_TIME`, `PREP_DURATION_H`,
-`PREP_N_MEMBERS`, `PREP_SEED`, `PREP_VORTEX`, `PREP_WORKERS`,
-`PREP_START/END` (chunked reruns); GEFS-specific: `GEFS_CASE_DIR`,
-`GEFS_INIT_TIME`, `PREP_ASSIGN_MODE` (`parent_paired` — FHLO-style, the
-synthetic track inherits the environment of the parent member it was seeded
-from — `round_robin`, or `random`).
+Output layout: `data/ensemble/beryl_gefs_1000/{STORM}_M{NNN}/` with
+`_track.csv`, `member_assignment.txt`, `_dataset.pkl`, `fast_reference.csv`,
+`fast_reference.png`; the run finishes with an ensemble peak-intensity
+summary (mean/median/min/max/sd across members).
 
 ---
 
@@ -281,14 +257,17 @@ from — `round_robin`, or `random`).
 
 | use | source | local dir |
 |---|---|---|
-| SST | ERA5 SSTK / OISST (GHRSST) | `data/era5`, `data/oisst` |
-| env fields (T/Q/U/V/Z/MSL) | ERA5 analysis / GEFS forecast | `data/era5`, CFS `gefs_root` |
-| parent ensemble tracks | ECMWF TIGGE XML / GEFS GRIB2 | CFS `ecmwf_root` / `gefs_root` |
+| SST (deterministic) | ERA5 SSTK / OISST (GHRSST) | `data/era5`, `data/oisst` |
+| SST (ensemble) | GEFS skt skin temperature | `data/gefs_beryl/skt_*.nc` |
+| env fields (T/Q/U/V/Z/MSL) | ERA5 analysis / GEFS forecast | `data/era5`, `data/gefs_beryl` |
+| parent ensemble tracks | ECMWF TIGGE XML | CFS `ecmwf_root` |
 | best track | IBTrACS | `data/ibtracs` |
 
 Local ERA5/OISST crops are **time-cropped, full spatial domain** (NA archive
-0–80°N / 0–360°) so vortex surgery never hits a data edge. Demo data is
-self-contained. Crop with `download/crop_beryl_sample.py NA 2024 <STORM>`.
+0–80°N / 0–360°) so vortex surgery never hits a data edge. The GEFS ensemble
+crop is regional (0.5°, 3.5–48.5°N / 258.5–326°E); the surgery wrapper
+degrades gracefully near those edges (unfiltered center wind instead of a
+crash). Crop GEFS with `download/crop_gefs_finish.py` + `download/crop_gefs_skt.py`.
 
 ## Physics conventions
 
@@ -313,5 +292,5 @@ self-contained. Crop with `download/crop_beryl_sample.py NA 2024 <STORM>`.
 - Change storms: edit `storms =` in `config.txt` or `--storms <NAME>`
 - Switch SST source: `python run.py --sst OISST`
 - Track sampling for another storm: `tracks/batch_generate.py --storms <NAME>`
-- Full ensemble with GEFS environment: `ensemble/run_prep_gefs_ens1000.py`
-  (set `track_source = GEFS` in config.txt to sample from GEFS parents)
+- Full ensemble with GEFS environment: `python run.py --ensemble`
+  (see Pipeline 3; assignment modes `ecmwf` / `gefs` / `round_robin`)

@@ -1,7 +1,6 @@
 """Shared configuration for the FHLO synthetic-track pipeline.
 
 Everything is driven by the project-level config.txt (see FHLO/config.txt):
-    track_source = ECMWF | GEFS     ensemble providing parent tracks
     storms       = comma-separated  best-track storm dir names (blank = all)
     n_synth      = 1000             synthetic members per case
     duration_days= 11               requested forecast length (capped by the
@@ -9,15 +8,14 @@ Everything is driven by the project-level config.txt (see FHLO/config.txt):
 
 Directory layout (per forecast case = one ensemble cycle):
     tracks/processed/{storm_name}/{YYYYMMDDHH}/
-        raw.pkl                parent ensemble member tracks
+        raw.pkl                parent ensemble member tracks (ECMWF TIGGE)
         pairs_6h.pkl           6h velocity pairs + step indices
         markov_params_6h.pkl   per-step k=1 Gaussian conditional fits
-        synthetic_tracks_*.nc  sampled synthetic tracks
+        synthetic_tracks_*.nc  sampled synthetic tracks (with parent_track)
         tracks.png             (optional) track plot
 
 Data sources:
     ECMWF: /global/cfs/cdirs/m5011/Jay/TIGGE/ecmf/{year}/{YYYYMMDD}/*.xml
-    GEFS : /global/cfs/cdirs/m5011/Jay/ERA5/GFS/{...}/  (vortex tracking)
     Best track: data/ibtracs/{basin}/{year}/{STORM}/track_intensity_6h.csv
 """
 from pathlib import Path
@@ -48,14 +46,10 @@ def _cfg_overrides():
 _CFG = _cfg_overrides()
 # Community archives (read-only inputs). Precedence: config.txt > env > default.
 #   ecmwf_root : TIGGE ECMWF XML archive  ({year}/{YYYYMMDD}/*.xml)
-#   gefs_root  : GEFS GRIB2 archive       ({CASE}/grib2/pgrb2a|b/...)
 #   output_dir : best-track root          ({basin}/{year}/{STORM}/)
 ECMWF_BASE_DIR = Path(_CFG.get("ecmwf_root")
                       or os.environ.get("FHLO_ECMWF_ROOT")
                       or "/global/cfs/cdirs/m5011/Jay/TIGGE/ecmf")
-GEFS_BASE_DIR = Path(_CFG.get("gefs_root")
-                     or os.environ.get("FHLO_GEFS_ROOT")
-                     or "/global/cfs/cdirs/m5011/Jay/ERA5/GFS")
 BEST_TRACK_DIR = PROJECT_ROOT / _CFG.get("output_dir", "data/ibtracs")
 
 PROCESSED_TRACKS_DIR.mkdir(parents=True, exist_ok=True)

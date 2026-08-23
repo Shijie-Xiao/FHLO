@@ -446,17 +446,33 @@ def apply_vortex_surgery(u_2d, v_2d, lon_1d, lat_1d, storm_lon, storm_lat):
     lat_np = np.asarray(lat_1d, dtype=np.float64)
     if u_np.shape != (len(lat_np), len(lon_np)):
         u_np, v_np = (u_np.T, v_np.T) if u_np.shape == (len(lon_np), len(lat_np)) else (u_np, v_np)
+    li = np.argmin(np.abs(lat_np - storm_lat))
+    lj = np.argmin(np.abs(lon_np - ln))
+    # vortex_lib.get_box needs +-n_deg (40 deg) around the vortex center on
+    # BOTH axes. Regional 0.5-deg grids (GEFS crop) can clip that box near
+    # domain edges; degrade gracefully instead of crashing the member:
+    # shrink to the largest square-ish window that fits, and if even the
+    # 25-deg caller box cannot host a >=40-deg window, fall back to the
+    # unfiltered environmental wind at the storm center.
+    d_lat = abs(float(lat_np[1] - lat_np[0]))
+    n_need = int(40 / d_lat) + 1
+    i0 = max(0, li - n_need)
+    i1 = min(len(lat_np), li + n_need + 1)
+    j0 = max(0, lj - 2 * n_need)   # lon wraps, but stay in-array
+    j1 = min(len(lon_np), lj + 2 * n_need + 1)
+    if (i1 - i0) < n_need or (j1 - j0) < 2 * n_need:
+        return (float(np.nan_to_num(u_np[li, lj], nan=0.0)),
+                float(np.nan_to_num(v_np[li, lj], nan=0.0)))
     try:
-        vl = VORTEX_LIB(lon_np, lat_np, num_inv=3, xres=1)
-        _, _, uf, vf, _, _ = vl.vortex_surgery(u_np, v_np, ln, storm_lat)
+        vl = VORTEX_LIB(lon_np[j0:j1], lat_np[i0:i1], num_inv=3, xres=1)
+        _, _, uf, vf, _, _ = vl.vortex_surgery(u_np[i0:i1, j0:j1],
+                                               v_np[i0:i1, j0:j1], ln, storm_lat)
     except (IndexError, ValueError) as e:
         raise BoundaryError(
             f"Vortex surgery boundary error at lat={storm_lat:.2f} lon={ln:.2f}, "
             f"data lat=[{lat_np.min():.1f},{lat_np.max():.1f}]: {e}"
         ) from e
-    li = np.argmin(np.abs(lat_np - storm_lat))
-    lj = np.argmin(np.abs(lon_np - ln))
-    return float(np.nan_to_num(uf[li, lj], nan=0.0)), float(np.nan_to_num(vf[li, lj], nan=0.0))
+    return float(np.nan_to_num(uf[li - i0, lj - j0], nan=0.0)), float(np.nan_to_num(vf[li - i0, lj - j0], nan=0.0))
 
 
 def get_env_wnds_vortex(u_d, v_d, lat, lon, lk, latk, lonk, box=25):

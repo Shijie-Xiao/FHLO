@@ -1,14 +1,22 @@
 """Sample synthetic ensemble tracks from per-step Markov params.
 
-Case layout: tracks/processed/{storm}/{YYYYMMDDHH}/
+Case layout (FHLO new): tracks/processed/{storm}_{year}/{YYYYMMDDHH}/
     markov_params_6h.pkl -> synthetic_tracks_{n}members.nc
+
 Sampling: per-step conditional Gaussians (FHLO paper sec.3a), init positions
 and velocities bootstrapped from parent members, length capped by the 75%
 survival horizon.
+
+Member-paired inheritance (FHLO-style, merged from the PINN version): when
+raw.pkl carries parent attribution ('parent_member' for GEFS, numeric
+'member_id' -> 'eNN' for ECMWF TIGGE), each parent seeds an equal block of
+synthetic tracks (with-replacement bootstrap inside the block) and the NC
+records parent_track[i] = parent index k. Downstream ensemble prep then
+serves track i its environment from parent member parents[k] -- track and
+environment stay self-consistent.
 """
 import pickle
 import sys
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -46,6 +54,9 @@ def _load_init_cloud(case_dir: Path):
         dy = np.deg2rad(float(lat[1]) - float(lat[0]))
         u_list.append(dx * Earth_Radius / dt_sec)
         v_list.append(dy * Earth_Radius / dt_sec)
+        # parent attribution: GEFS raw.pkl carries 'parent_member'
+        # ('c00'/'p07'...); ECMWF TIGGE raw.pkl carries numeric member_id
+        # (0=control, 1..50=perturbed) -> synthesize 'e00'/'e07'
         pm = tr.get("parent_member")
         if pm is None and tr.get("member_id") is not None:
             pm = f"e{int(tr['member_id']):02d}"
@@ -58,13 +69,13 @@ def _load_init_cloud(case_dir: Path):
         "u": np.array(u_list),
         "v": np.array(v_list),
         "parent": parent_list,
-        "storm_dir": raw.get("storm_config", {}).get("storm_dir"),
     }
 
 
 def sample_case(case_dir: Path, n_tracks=N_TRACKS,
                 duration_days=DURATION_DAYS, seed=42):
     """markov_params_6h.pkl -> synthetic_tracks_*.nc for one case dir."""
+    case_dir = Path(case_dir)
     params_file = case_dir / "markov_params_6h.pkl"
     if not params_file.exists():
         return None
@@ -86,8 +97,32 @@ def sample_case(case_dir: Path, n_tracks=N_TRACKS,
     lon_init = np.zeros(n_tracks)
     lat_init = np.zeros(n_tracks)
     u_init = v_init = None
+    parent_track = np.full(n_tracks, -1, int)
+    parent_codes = None
+
     if init_cloud:
-        idx = rng.integers(0, len(init_cloud["lon"]), size=n_tracks)
+        parents = init_cloud.get("parent") or []
+        have_parents = (len(parents) == len(init_cloud["lon"])
+                        and all(p is not None for p in parents))
+        if have_parents:
+            # FHLO-style member-paired bootstrap: each parent member seeds an
+            # equal block of synthetic tracks, sampled WITH replacement within
+            # the block. Track i in block k inherits parent k's initial state
+            # AND its environment assignment (parent_track[i] = k).
+            n_par = len(parents)
+            base = n_tracks // n_par
+            rem = n_tracks - base * n_par
+            idx_blocks, par_blocks = [], []
+            for k in range(n_par):
+                size = base + (1 if k < rem else 0)
+                if size:
+                    idx_blocks.append(rng.integers(k, k + 1, size=size))
+                    par_blocks.append(np.full(size, k, int))
+            idx = np.concatenate(idx_blocks)
+            parent_track = np.concatenate(par_blocks)
+            parent_codes = list(parents)
+        else:
+            idx = rng.integers(0, len(init_cloud["lon"]), size=n_tracks)
         lon_init = init_cloud["lon"][idx]
         lat_init = init_cloud["lat"][idx]
         if init_cloud.get("u") is not None:
@@ -130,36 +165,39 @@ def sample_case(case_dir: Path, n_tracks=N_TRACKS,
 
     nc_path = case_dir / f"synthetic_tracks_{n_tracks}members.nc"
     if HAS_XARRAY:
+        data_vars = {
+            "lon": (["track", "time"], lon),
+            "lat": (["track", "time"], lat),
+            "u": (["track", "time"], u),
+            "v": (["track", "time"], v),
+        }
+        attrs = {
+            "storm": storm_name,
+            "dt_hours": dt_hours,
+            "init_time": str(init_time),
+            "n_tracks": n_tracks,
+            "duration_days": duration_days,
+        }
+        if parent_codes is not None and np.any(parent_track >= 0):
+            data_vars["parent_track"] = (["track"], parent_track)
+            attrs["parent_members"] = ",".join(str(c) for c in parent_codes)
+            attrs["assignment"] = "member_paired"
+        else:
+            attrs["assignment"] = "pooled"
         xr.Dataset(
-            {
-                "lon": (["track", "time"], lon),
-                "lat": (["track", "time"], lat),
-                "u": (["track", "time"], u),
-                "v": (["track", "time"], v),
-            },
+            data_vars,
             coords={
                 "track": np.arange(n_tracks),
                 "time": np.arange(n_steps) * dt_hours * 3600.0,
             },
-            attrs={
-                "storm": storm_name,
-                "dt_hours": dt_hours,
-                "init_time": str(init_time),
-                "n_tracks": n_tracks,
-                "duration_days": duration_days,
-                "storm_dir": str(init_cloud.get("storm_dir") or ""),
-            },
+            attrs=attrs,
         ).to_netcdf(nc_path, format="NETCDF4")
     return nc_path
 
 
 def run_sample_tracks(storm=None, year=None, n_tracks=N_TRACKS,
                       duration_days=DURATION_DAYS, plot=False):
-    """Sample (and optionally plot) every case dir under one storm or all.
-
-    storm: storm name (e.g. 'IRMA'); year optional but recommended to pick
-    tracks/processed/{name}_{year}/ when several years share a name.
-    """
+    """Sample (and optionally plot) every case dir under one storm or all."""
     from plot_tracks import plot_case
     if storm:
         from config import storm_dir_name

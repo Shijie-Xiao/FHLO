@@ -21,32 +21,26 @@ sst_source = OISST
 # ---- Environment fields source: ERA5 | GEFS ----
 env_source = ERA5
 
-# ---- Sampled tracks source: ECMWF | GEFS (ensemble track sampling) ----
-track_source = ECMWF
-
 # ---- Local data dirs (time-cropped, full spatial domain; demo-shippable) ----
 # era5_dir : local ERA5 crop actually READ by run.py prep / ensemble prep
 # oisst_dir: local OISST crop actually READ by run.py prep
 era5_dir = data/era5
 oisst_dir = data/oisst
 
-# ---- Remote / community archives (read by download/crop scripts, tracks/,
-#      ensemble/gefs_ens_adapter.py, ensemble/run_prep_gefs_ens1000.py) ----
+# ---- GEFS ensemble forecast (run.py --ensemble) ----
+# gefs_beryl_dir: local GEFS forecast nc (pgrb2a/pgrb2b/skt per member)
+# gefs_init     : GEFS forecast init time
+gefs_beryl_dir = data/gefs_beryl
+gefs_init = 2024-06-28 12:00
+
+# ---- Remote / community archives (read by download/crop scripts, tracks/) ----
 # era5_root  : CFS ERA5 archive root
 # oisst_root : CFS OISST archive root
-# gefs_root  : GEFS GRIB2 archive root ({CASE}/grib2/pgrb2a|b/...)
 # ecmwf_root : TIGGE ECMWF XML archive root ({year}/{YYYYMMDD}/*.xml)
 era5_root = /global/cfs/cdirs/m5011/Jay/ERA5
 oisst_root = /global/cfs/cdirs/m5011/Jay/OHC
-gefs_root = /global/cfs/cdirs/m5011/Jay/ERA5/GFS
 ecmwf_root = /global/cfs/cdirs/m5011/Jay/TIGGE/ecmf
-
-# ---- Optional: GEFS cfgrib->NetCDF cache (ensemble adapter) ----
-# gefs_cache_dir = data/gefs_nc_cache
-
-# ---- Optional: specific GEFS case for ensemble/run_prep_gefs_ens1000.py ----
-# (default: {gefs_root}/2025_ERIN_NA)
-# gefs_case_dir = /global/cfs/cdirs/m5011/Jay/ERA5/GFS/2025_ERIN_NA
+gefs_grib_root = /global/cfs/cdirs/m5011/Jay/ERA5/GFS
 
 # ---- Parallelism ----
 n_workers = 4

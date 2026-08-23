@@ -197,31 +197,8 @@ def case_dir(storm_name: str, year, cycle: datetime) -> Path:
         / cycle.strftime("%Y%m%d%H")
 
 
-# ── GEFS source ───────────────────────────────────────────────────────────────
-def read_case_gefs(storm, cycle, min_members=None, save=True):
-    """Load one (storm, cycle) from GEFS GRIB2 vortex tracking."""
-    import gefs_tracks as gt
-    min_members = min_members or MIN_MEMBERS
-    # gefs_tracks.extract_gefs_tracks expects a case_dir + bt csv; locate by date
-    case_root = gt.GFS_ROOT / str(storm["year"]) / cycle.strftime("%Y%m%d%H")
-    if not case_root.is_dir():
-        return None
-    bt_csv = Path(storm["storm_dir"]) / "track_intensity_6h.csv"
-    result = gt.extract_gefs_tracks(case_root, bt_csv,
-                                    min_members=min_members)
-    if result is None or result.get("n_tracks", 0) < min_members:
-        return None
-    # normalize to the shared package layout
-    tracks = result["tracks"]
-    for tr in tracks:
-        tr["init_time"] = cycle
-    return _package_case(storm, cycle, tracks, "gefs", save)
-
-
 def read_case(storm, cycle, source="ecmwf", **kw):
-    """Dispatch to the configured source for one (storm, cycle) case."""
-    if source == "gefs":
-        return read_case_gefs(storm, cycle, **kw)
+    """Read one (storm, cycle) case from the parent ensemble (ECMWF TIGGE)."""
     return read_case_ecmwf(storm, cycle, **kw)
 
 
@@ -249,8 +226,7 @@ def run_read_cases(storms=None, source="ecmwf", init_times=None):
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--source", default="ecmwf", choices=["ecmwf", "gefs"])
     ap.add_argument("--storms", default="", help="comma-separated storm dir names")
     args = ap.parse_args()
     flt = [s for s in args.storms.split(",") if s.strip()] or None
-    run_read_cases(discover_storms(storms_filter=flt), source=args.source)
+    run_read_cases(discover_storms(storms_filter=flt), source="ecmwf")
