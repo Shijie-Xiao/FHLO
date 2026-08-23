@@ -348,6 +348,20 @@ def _open_pl(date_str, cache, cfg):
         p = _find_pl(v, date_str, cfg)
         out[v] = xr.open_dataset(p) if p else None
     cache[k] = out
+    # Cap open-day files per worker: each day holds 5 vars x 24h x 30 lev
+    # x full-grid; long storms otherwise keep every day open and RSS grows
+    # linearly until the node OOM-kills the pool.
+    if len(cache) > 3:
+        for old in list(cache)[:-3]:
+            if old == k:
+                continue
+            entry = cache.pop(old)
+            for d in entry.values():
+                if d is not None:
+                    try:
+                        d.close()
+                    except Exception:
+                        pass
     return cache[k]
 
 

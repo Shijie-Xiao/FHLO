@@ -165,6 +165,35 @@ def _find_pl(var, date_str, cfg):
     return None
 
 
+def _fill_missing_levels(arr, lev):
+    """Fill NaN levels (2-D lat/lon slabs) by linear interp in log-p.
+
+    GEFS pgrb2b p25-p30 only shipped partial t/q levels (mandatory ones were
+    lost); u/v/gh come from pgrb2a (6 levels) and q/t have holes. Interpolate
+    vertically onto the full 31-level ladder so PI/chi profiles stay physical.
+    """
+    lev = np.asarray(lev, float)
+    good = ~np.isnan(arr).all(axis=(1, 2)) if arr.ndim == 3 \
+        else ~np.isnan(arr)
+    if good.all() or good.sum() < 2:
+        return arr, lev
+    lp = np.log(lev)
+    lg = lp[good]
+    for j in np.where(~good)[0]:
+        arr[j] = _interp_slab(arr, good, lp[j], lg)
+    return arr, lev
+
+
+def _interp_slab(arr, good, lp_j, lg):
+    """Column-wise vertical interpolation of one NaN level slab."""
+    # arr[good]: (n_good, lat, lon); linear in log-p per grid column
+    lo = np.searchsorted(lg, lp_j) - 1
+    lo = max(0, min(lo, len(lg) - 2))
+    w = (lp_j - lg[lo]) / (lg[lo + 1] - lg[lo])
+    slabs = arr[good]
+    return (1 - w) * slabs[lo] + w * slabs[lo + 1]
+
+
 def _get_pl_slices(t, pl_cache, cfg):
     """T/Q/U/V/Z with ALL levels, time-interpolated, from a+b merged.
 
@@ -183,25 +212,36 @@ def _get_pl_slices(t, pl_cache, cfg):
     dims = ('isobaricInhPa', 'latitude', 'longitude')
 
     def merged_var(short):
-        # b-stream slab (its own levels)
+        in_b = ds_b is not None and short in ds_b.data_vars
+        in_a = ds_a is not None and short in ds_a.data_vars
+        if not in_b and not in_a:
+            return None
+        if not in_a:  # b-only variable (e.g. t: pgrb2b partial levels)
+            arr_b = _time_interp(ds_b, short, fh0, fh1, t)
+            lev = ds_b['isobaricInhPa'].values
+            arr_b, lev = _fill_missing_levels(arr_b, lev)
+            return xr.DataArray(arr_b, dims=dims,
+                                coords={'isobaricInhPa': lev,
+                                        'latitude': latc, 'longitude': lonc})
+        if not in_b:  # a-only variable (p25-p30: u/v/gh live in pgrb2a only)
+            arr_a = _time_interp(ds_a, short, fh0, fh1, t)
+            lev = ds_a['isobaricInhPa'].values
+            arr_a, lev = _fill_missing_levels(arr_a, lev)
+            return xr.DataArray(arr_a, dims=dims,
+                                coords={'isobaricInhPa': lev,
+                                        'latitude': latc, 'longitude': lonc})
+        # both streams: b slab + NaN levels backfilled from a's mandatory set
         arr_b = _time_interp(ds_b, short, fh0, fh1, t)
         lev_b = ds_b['isobaricInhPa'].values
-        if ds_a is None or short not in ds_a.data_vars or short == 'q':
-            good = ~np.isnan(arr_b[:, 0, 0]) if arr_b.ndim == 3 else slice(None)
-            return xr.DataArray(arr_b, dims=dims,
-                                coords={'isobaricInhPa': lev_b,
-                                        'latitude': latc, 'longitude': lonc})
-        # a-stream slab (mandatory levels), aligned onto b's grid
         arr_a = _time_interp(ds_a, short, fh0, fh1, t)
         lev_a = ds_a['isobaricInhPa'].values
         out = arr_b.copy()
         lev_out = lev_b.copy()
         idx_a = {int(v): i for i, v in enumerate(lev_a)}
-        idx_b = {int(v): i for i, v in enumerate(lev_b)}
         for j, v in enumerate(lev_b):
             if np.isnan(out[j]).all() and int(v) in idx_a:
                 out[j] = arr_a[idx_a[int(v)]]
-        # a-stream-only levels (none in practice: b is a superset) ignored
+        out, lev_out = _fill_missing_levels(out, lev_out)
         return xr.DataArray(out, dims=dims,
                             coords={'isobaricInhPa': lev_out,
                                     'latitude': latc, 'longitude': lonc})
@@ -210,7 +250,8 @@ def _get_pl_slices(t, pl_cache, cfg):
     for short, key in [('t', 'T'), ('q', 'Q'), ('u', 'U'), ('v', 'V')]:
         slices[key] = merged_var(short)
     slices['Z'] = merged_var('gh')
-    slices['Z'].values *= 9.80665
+    if slices['Z'] is not None:
+        slices['Z'] = slices['Z'] * 9.80665
     return slices
 
 

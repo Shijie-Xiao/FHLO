@@ -193,6 +193,7 @@ def _ens_prep_batch(batch):
             gefs_nc_adapter.set_active_member(member_code, gefs_init, gefs_dir)
             gefs_nc_adapter.install()
         import prepare_complete_training_data as prep
+        import gc
         for job in batch:
             mi, track_csv, out_dir, member_code, gefs_init, gefs_dir = job[:6]
             out_dir = Path(out_dir)
@@ -206,19 +207,33 @@ def _ens_prep_batch(batch):
                 if ds is None:
                     out.append((mi, False, 'no valid steps'))
                     continue
+                # Slim for storage: drop the bulky spatial env grids
+                # (spatial_3d/spatial_2d); keep the ODE coefficients
+                # (scalars=alpha/beta/gamma/vp, chi/s/xs refs, env winds,
+                # translation, Cd/BLH, v_gt, times/track).
+                for k in ('spatial_3d', 'spatial_2d'):
+                    ds.pop(k, None)
                 ds['gefs_member'] = member_code
                 with open(out_pkl, 'wb') as f:
                     pickle.dump(ds, f, protocol=4)
-                out.append((mi, True, f'T={ds["spatial_3d"].shape[1]}'))
+                out.append((mi, True, f'T={len(ds["times"])}'))
             except Exception as e:
                 out.append((mi, False, f'{type(e).__name__}: {e}'))
+            finally:
+                # ERA5 mode: caches are per-storm dicts, but xarray chunk
+                # buffers linger; release between members to cap peak RSS
+                gc.collect()
     except Exception as e:
         out.extend((j[0], False, f'init {type(e).__name__}: {e}') for j in batch)
     return out
 
 
 def _ens_ode_one(job):
-    """Ensemble ODE worker: one member pkl -> fast csv/png."""
+    """Ensemble ODE worker: one member pkl -> per-member fast csv + arrays.
+
+    Returns (mi, ok, msg, result) where result carries the member's V(t)
+    series (v_fast/v_max/vp/v_obz/m, kts) for the ensemble NC.
+    """
     mi, out_dir = job
     sys.path.insert(0, str(PROJECT_ROOT / 'physics'))
     import run_fast_reference as fast
@@ -226,10 +241,20 @@ def _ens_ode_one(job):
     pkl = out_dir / f'{out_dir.name}_dataset.pkl'
     try:
         import numpy as np
-        r = fast.process_one_pkl(pkl)
-        return mi, True, f"peak={np.nanmax(r['v_max_kts']):.0f} kts"
+        import pandas as pd
+        r = fast.process_one_pkl(pkl, save_csv=True, save_plot=False)
+        csv = out_dir / 'fast_reference.csv'
+        if csv.exists():
+            df = pd.read_csv(csv)
+            res = {k: df[k].to_numpy(dtype=float)
+                   for k in ('v_fast_kts', 'v_max_kts', 'vp_kts',
+                             'v_obz_kts', 'm')}
+            res['time'] = pd.to_datetime(df['time']).to_numpy()
+        else:
+            res = None
+        return mi, True, f"peak={np.nanmax(r['v_max_kts']):.0f} kts", res
     except Exception as e:
-        return mi, False, f'{type(e).__name__}: {e}'
+        return mi, False, f'{type(e).__name__}: {e}', None
 
 
 def run_ensemble(args, cfg):
@@ -341,39 +366,247 @@ def run_ensemble(args, cfg):
                     if (d / f'{d.name}_dataset.pkl').exists()]
         print(f'[ens ode] {len(ode_jobs)} FAST ODE runs, workers={args.workers}')
         n_ok = 0
+        results = {}
         with ProcessPoolExecutor(max_workers=args.workers,
                                  initializer=_worker_init) as ex:
             futs = {ex.submit(_ens_ode_one, j): j[0] for j in ode_jobs}
             done = 0
             for fut in as_completed(futs):
-                mi, ok, msg = fut.result()
+                mi, ok, msg, res = fut.result()
                 n_ok += ok
                 done += 1
+                if res is not None:
+                    results[mi] = res
                 if not ok or done % 10 == 0 or done == len(ode_jobs):
                     print(f'  [{"OK" if ok else "FAIL"}] M{mi:03d}: {msg}')
         print(f'[ens ode] done: {n_ok}/{len(ode_jobs)} '
               f'({time.time() - t0:.0f}s)')
+        _save_ensemble_nc(out_root, sd.name, results, env, args.assign,
+                          args.gefs_init)
         _summarize_ensemble(out_root, sd.name)
+        _plot_ensemble(out_root, sd.name)
+
+    if 'plot' in stages and 'ode' not in stages:
+        # plot-only invocation (e.g. --stage plot) reads the saved NC
+        _plot_ensemble(out_root, sd.name)
 
 
-def _summarize_ensemble(out_root, storm_name):
-    """Print ensemble peak-intensity stats across members."""
-    import glob
+def _plot_ensemble(out_root, storm_name):
+    """Render ensemble_fast.png/svg from ensemble_fast.nc (FAST-only)."""
+    out_root = Path(out_root)
+    nc = out_root / 'ensemble_fast.nc'
+    if not nc.exists():
+        print(f'[ens plot] missing {nc}, skip')
+        return
+    try:
+        import subprocess
+        cmd = [sys.executable,
+               str(PROJECT_ROOT / 'ensemble' / 'plot_ensemble_fast.py'),
+               '--ens-nc', str(nc),
+               '--out_png', str(out_root / 'ensemble_fast.png'),
+               '--storm', storm_name.split('_')[-1] if '_' in storm_name
+               else storm_name]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        for ln in (r.stdout or '').strip().splitlines():
+            print(f'  {ln}')
+        if r.returncode != 0:
+            print(f'[ens plot] FAILED: {(r.stderr or "").strip()[-300:]}')
+        else:
+            print(f'[ens plot] saved {out_root / "ensemble_fast.png"} (+svg)')
+    except Exception as e:
+        print(f'[ens plot] {type(e).__name__}: {e}')
+
+
+def _save_ensemble_nc(out_root, storm_name, results, env, assign, init_time):
+    """Assemble per-member FAST series into ONE ensemble NetCDF.
+
+    Layout (plot_vs_google_vmax.py ready):
+      fast_vmax_kts (member, hour)  -- ODE Vmax
+      fast_v_kts / vp_kts / v_obz_kts / m likewise; hour = hours since init.
+    Also fast_chi/fast_s (from prep pkls) for the vent panel, seq_len marks
+    each member's valid length (ragged tracks are NaN-padded).
+    """
+    import pickle
     import numpy as np
-    import pandas as pd
-    peaks, pkl_n = [], 0
-    for csvf in sorted(Path(out_root).glob('*/fast_reference.csv')):
+    import xarray as xr
+
+    out_root = Path(out_root)
+    if not results:
+        print('[ens nc] no ODE results, skip')
+        return
+    mis = sorted(results)
+    T = max(len(results[mi]['v_max_kts']) for mi in mis)
+    n = len(mis)
+    times0 = results[mis[0]].get('time')
+    hours = np.arange(T, dtype=float)
+    base = np.datetime64('2000-01-01') if times0 is None else times0[0]
+
+    def pad(key):
+        arr = np.full((n, T), np.nan)
+        for i, mi in enumerate(mis):
+            v = np.asarray(results[mi].get(key), float)
+            arr[i, :len(v)] = v
+        return arr
+
+    fields = {
+        'fast_vmax_kts': (('member', 'hour'), pad('v_max_kts')),
+        'fast_v_kts': (('member', 'hour'), pad('v_fast_kts')),
+        'vp_kts': (('member', 'hour'), pad('vp_kts')),
+        'v_obz_kts': (('member', 'hour'), pad('v_obz_kts')),
+        'm': (('member', 'hour'), pad('m')),
+        'seq_len': (('member',), np.array([len(results[mi]['v_max_kts'])
+                                           for mi in mis], int)),
+    }
+    # chi/s per member from the slim pkls (vent panel input)
+    chi_arr = np.full((n, T), np.nan)
+    s_arr = np.full((n, T), np.nan)
+    for i, mi in enumerate(mis):
+        pkl = out_root / f'{storm_name}_M{mi:03d}' / \
+            f'{storm_name}_M{mi:03d}_dataset.pkl'
+        if not pkl.exists():
+            continue
         try:
-            df = pd.read_csv(csvf)
-            peaks.append(df['v_max_kts'].max())
-            pkl_n += 1
+            ds = pickle.load(open(pkl, 'rb'))
+            c = np.asarray(ds.get('chi_ref', []), float).ravel()
+            s = np.asarray(ds.get('s_ref', []), float).ravel()
+            chi_arr[i, :len(c)] = c
+            s_arr[i, :len(s)] = s
         except Exception:
             pass
-    if peaks:
-        p = np.asarray(peaks)
-        print(f'[ens summary] {len(p)} members | peak kts: '
-              f'mean={p.mean():.0f} median={np.median(p):.0f} '
-              f'min={p.min():.0f} max={p.max():.0f} sd={p.std():.1f}')
+    fields['fast_chi'] = (('member', 'hour'), chi_arr)
+    fields['fast_s'] = (('member', 'hour'), s_arr)
+
+    # member codes from assignment files
+    codes = []
+    for mi in mis:
+        asg = out_root / f'{storm_name}_M{mi:03d}' / 'member_assignment.txt'
+        c = ''
+        if asg.exists():
+            for ln in asg.read_text().splitlines():
+                if ln.startswith('gefs_member='):
+                    c = ln.split('=', 1)[1].strip()
+        codes.append(c)
+    try:
+        time_coord = np.array([base + np.timedelta64(int(h), 'h')
+                               for h in hours])
+    except Exception:
+        time_coord = hours.astype('datetime64[h]')
+
+    ds_out = xr.Dataset(
+        fields,
+        coords={'member': np.array(mis), 'hour': hours, 'time': time_coord},
+        attrs={'storm': storm_name, 'env': env, 'assign': assign,
+               'init_time': str(init_time),
+               'gefs_members': ','.join(codes)})
+    out = out_root / 'ensemble_fast.nc'
+    ds_out.to_netcdf(out)
+    peaks = np.nanmax(fields['fast_vmax_kts'][1], axis=1)
+    print(f'[ens nc] saved {out} ({n} members x {T} h, '
+          f'peak mean={np.nanmean(peaks):.0f} max={np.nanmax(peaks):.0f} kts)')
+
+
+def _summarize_ensemble(out_root, storm_name, save=True):
+    """Collect per-member coefficients + winds into ensemble-level files.
+
+    Outputs (in out_root):
+      ensemble_winds.csv   long-format V(t): member, gefs_member, hour,
+                           v_max_kts, v_obz_kts (per ODE step)
+      ensemble_summary.nc  (member, hour): chi/u250/v250/u850/v850/shear from
+                           the prep pkls + per-member peak_kts
+    Prints the peak-intensity summary line.
+    """
+    import pickle
+    import numpy as np
+    import pandas as pd
+
+    out_root = Path(out_root)
+    winds_rows, coef = [], []
+    peaks = []
+    for mdir in sorted(out_root.glob('*/')):
+        csvf = mdir / 'fast_reference.csv'
+        pklf = mdir / f'{mdir.name}_dataset.pkl'
+        if not csvf.exists():
+            continue
+        mi = int(mdir.name.rsplit('_M', 1)[-1])
+        mem_code = None
+        asg = mdir / 'member_assignment.txt'
+        if asg.exists():
+            for ln in asg.read_text().splitlines():
+                if ln.startswith('gefs_member='):
+                    mem_code = ln.split('=', 1)[1].strip()
+        try:
+            df = pd.read_csv(csvf)
+        except Exception:
+            continue
+        hours = pd.to_datetime(df['time'])
+        hr = (hours - hours.iloc[0]).dt.total_seconds() / 3600.0
+        obz = df.get('v_obz_kts')
+        for t, v, vo in zip(hr, df['v_max_kts'],
+                            obz if obz is not None else [np.nan] * len(df)):
+            winds_rows.append((mi, mem_code, float(t), float(v),
+                               float(vo) if vo == vo else np.nan))
+        if len(df):
+            peaks.append(float(df['v_max_kts'].max()))
+        # coefficients from the prep pkl (chi + env winds per hour)
+        if pklf.exists():
+            try:
+                ds = pickle.load(open(pklf, 'rb'))
+                n = len(ds.get('times', []))
+                chi = np.asarray(ds.get('chi_ref', []), float).ravel()
+                chi = chi[:n] if chi.size >= n else np.full(n, np.nan)
+                env = ds.get('env_wnds')
+                env = env if env is not None else [None] * n
+                cols = np.full((n, 4), np.nan)
+                for k, e in enumerate(env[:n]):
+                    ev = np.asarray(e, float).ravel()
+                    if ev.size >= 4:
+                        cols[k] = ev[:4]
+                u250, v250, u850, v850 = cols.T
+                shear = np.hypot(u250 - u850, v250 - v850)
+                coef.append((mi, mem_code, n, chi, u250, v250, u850, v850, shear))
+            except Exception:
+                pass
+
+    if not peaks:
+        print('[ens summary] no completed members found')
+        return
+    p = np.asarray(peaks)
+    print(f'[ens summary] {len(p)} members | peak kts: '
+          f'mean={p.mean():.0f} median={np.median(p):.0f} '
+          f'min={p.min():.0f} max={p.max():.0f} sd={p.std():.1f}')
+    if not save:
+        return
+
+    wdf = pd.DataFrame(winds_rows,
+                       columns=['member', 'gefs_member', 'hour',
+                                'v_max_kts', 'v_obz_kts'])
+    wdf.to_csv(out_root / 'ensemble_winds.csv', index=False)
+
+    try:
+        import xarray as xr
+        T = max(c[2] for c in coef) if coef else 0
+        M = len(coef)
+        fields = {}
+        for fi, fname in enumerate(['chi', 'u250', 'v250', 'u850', 'v850',
+                                    'shear']):
+            arr = np.full((M, T), np.nan)
+            for i, c in enumerate(coef):
+                v = c[3 + fi]
+                arr[i, :len(v)] = v
+            fields[fname] = (('member', 'hour'), arr)
+        if M:
+            fields['peak_kts'] = (('member',), [c[0] for c in coef])
+        ds_out = xr.Dataset(
+            fields,
+            coords={'member': np.array([c[0] for c in coef]),
+                    'hour': np.arange(T, dtype=float)},
+            attrs={'storm': storm_name,
+                   'gefs_members': ','.join(str(c[1]) for c in coef if c[1])})
+        ds_out.to_netcdf(out_root / 'ensemble_summary.nc')
+        print(f'[ens summary] saved ensemble_winds.csv ({len(wdf)} rows) '
+              f'+ ensemble_summary.nc ({M} members x {T} h)')
+    except ImportError:
+        pass
 
 
 # ---------- Pipeline ----------
@@ -426,18 +659,22 @@ def main():
 
     if args.ensemble:
         if not args.synth_nc:
-            print('--ensemble requires --synth-nc')
+            key = 'synth_gefs_nc' if args.env == 'gefs' else 'synth_ecmwf_nc'
+            args.synth_nc = cfg.get(key, '')
+        if not args.synth_nc:
+            print('--ensemble requires --synth-nc (or config '
+                  'synth_gefs_nc/synth_ecmwf_nc)')
             return
         if not args.assign:
             args.assign = 'gefs' if args.env == 'gefs' else 'ecmwf'
         if not args.out_root:
             args.out_root = str(PROJECT_ROOT / 'data' / 'ensemble'
-                                / ('beryl_gefs_1000' if args.env == 'gefs'
-                                   else 'beryl_era5_1000'))
+                                / ('beryl_gefs' if args.env == 'gefs'
+                                   else 'beryl_era5'))
         if not args.workers:
             args.workers = int(cfg.get('n_workers', 4))
         if args.stage in ('prep,ode', ''):
-            args.stage = 'eprep,ode'
+            args.stage = 'eprep,ode,plot'
         run_ensemble(args, cfg)
         return
 

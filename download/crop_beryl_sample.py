@@ -34,8 +34,9 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-ERA5_ROOT = '/global/cfs/cdirs/m5011/Jay/ERA5'
-OISST_ROOT = '/global/cfs/cdirs/m5011/Jay/OHC'
+# Community archive roots (override: env FHLO_ERA5_ROOT/FHLO_OISST_ROOT or config.txt)
+ERA5_ROOT = os.environ.get('FHLO_ERA5_ROOT', '/global/cfs/cdirs/m5011/Jay/ERA5')
+OISST_ROOT = os.environ.get('FHLO_OISST_ROOT', '/global/cfs/cdirs/m5011/Jay/OHC')
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUT_ERA5 = PROJECT_ROOT / 'data' / 'era5'
 OUT_OISST = PROJECT_ROOT / 'data' / 'oisst'

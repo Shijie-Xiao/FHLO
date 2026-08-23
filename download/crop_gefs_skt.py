@@ -15,7 +15,8 @@ import xarray as xr
 
 LAT0, LAT1 = 3.5, 48.5
 LON0, LON1 = 258.5, 326.0
-GEFS_ROOT = '/global/cfs/cdirs/m5011/Jay/ERA5/GFS/2024_BERYL_NA/grib2'
+GEFS_ROOT = os.environ.get('FHLO_GEFS_ROOT',
+                           '/global/cfs/cdirs/m5011/Jay/ERA5/GFS/2024_BERYL_NA/grib2')
 OUT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                    'data', 'gefs_beryl')
 

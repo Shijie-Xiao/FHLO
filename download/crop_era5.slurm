@@ -5,16 +5,17 @@
 #SBATCH -C cpu
 #SBATCH -c 16
 #SBATCH -t 120
-#SBATCH -o /pscratch/sd/s/sixao74/Deepmind/FHLO/logs/crop_%j.out
-#SBATCH -e /pscratch/sd/s/sixao74/Deepmind/FHLO/logs/crop_%j.err
+#SBATCH -o logs/crop_%j.out
+#SBATCH -e logs/crop_%j.err
 
 # Crop ERA5 (+OISST) by date, full spatial domain, for one storm.
 # Usage: sbatch crop_era5.slurm [BASIN YEAR STORM]
+# NOTE: submit from the repo root (paths are relative to the checkout dir).
 
 module load conda
 source activate fast_ml
 
-cd /pscratch/sd/s/sixao74/Deepmind/FHLO
+cd "$(dirname "$0")/.."
 mkdir -p logs data/era5 data/oisst
 
 BASIN=${1:-NA}

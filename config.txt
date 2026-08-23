@@ -28,10 +28,14 @@ era5_dir = data/era5
 oisst_dir = data/oisst
 
 # ---- GEFS ensemble forecast (run.py --ensemble) ----
-# gefs_beryl_dir: local GEFS forecast nc (pgrb2a/pgrb2b/skt per member)
-# gefs_init     : GEFS forecast init time
+# gefs_beryl_dir : local GEFS forecast nc (pgrb2a/pgrb2b/skt per member)
+# gefs_init      : GEFS forecast init time
+# synth_gefs_nc  : synthetic tracks NC sampled from GEFS TIGGE parents
+# synth_ecmwf_nc : synthetic tracks NC sampled from ECMWF TIGGE parents
 gefs_beryl_dir = data/gefs_beryl
 gefs_init = 2024-06-28 12:00
+synth_gefs_nc = tracks/processed/beryl_2024/2024062812_gefs/synthetic_tracks_1000members.nc
+synth_ecmwf_nc = tracks/processed/beryl_2024/2024062900/synthetic_tracks_1000members.nc
 
 # ---- Remote / community archives (read by download/crop scripts, tracks/) ----
 # era5_root  : CFS ERA5 archive root
