@@ -12,8 +12,8 @@ So NO per-storm regional ERA5 is needed -- everything comes from the already
 prepared per-track data + climatology. This is the no-forcing, no-nudging,
 fully-divergent free run (real intensity spread).
 
-  * FAST     : chi = fast_chi (= clip(chi_ref*5,4)),  S = fast_s
-  * FAST-ML  : chi = ml_chi * vent_scale,             S = ml_s
+  * FAST     : chi = fast_chi (= Lin calibration of chi_ref),  S = fast_s
+  * FAST-ML  : chi = ml_chi * vent_scale,                     S = ml_s
 
 Usage:
   python run_ode_from_chis.py --in_nc ...chi_s.nc --out_nc ...ode.nc \
@@ -36,7 +36,21 @@ PRECALC = PINN / 'precalc_data'
 MS = 0.514444
 T_MAX_H = 264.0
 DT_EVAL_H = 1.0
-C_K = 0.0015
+C_K = 1.2e-3   # Lin namelist Ck; pair with H_BL below (was 0.0015/1000)
+H_BL = 1400.0  # Lin namelist atm_bl_depth['NA']
+# ── Lin et al. official chi calibration (tropical_cyclone_risk util/compute.py):
+#    chi_eff = clip(exp(log(chi + 1e-3) + log_chi_fac) + chi_fac, 1e-5, 5)
+# with log_chi_fac = 0.5, chi_fac = 1.3 (namelist). Replaces the legacy
+# local hack clip(chi * 5, 0, 4).
+LOG_CHI_FAC = 0.5
+CHI_FAC = 1.3
+
+
+def _chi_calibrated_lin(chi_val, nan_fill=1e-10):
+    chi_val = np.asarray(chi_val, dtype=np.float64)
+    chi_val = np.maximum(np.nan_to_num(chi_val, nan=nan_fill), nan_fill)
+    chi_eff = np.exp(np.log(chi_val + 1e-3) + LOG_CHI_FAC) + CHI_FAC
+    return np.clip(chi_eff, 1e-5, 5.0)
 # prep (process_one_storm) stores tcpyPI with V_reduc=0.8 (gradient->10m surface
 # reduction). The FAST model's v_pot ceiling is calibrated on the *gradient-wind*
 # PI (as the old Reproduce ERA5EnvProvider supplied). So un-reduce: v_pot = vp/0.8.
@@ -215,7 +229,8 @@ def _load_bt_history(bt_pkl, ref_time, hours=48):
     the same window, from the same pkl ('scalars'/'chi_ref'/'s_ref'): ERA5
     analysis fields driving the FHLO initialization period, per Lin et al.
     2020 §3e ("environmental parameters ... from the analysis fields").
-    chi_eff = clip(chi_ref * 5, 0, 4), identical to the FAST calibration.
+    chi_eff = chi_calibrated(chi_ref), the Lin et al. calibration
+    exp(ln(chi+1e-3)+0.5)+1.3 clipped to [1e-5, 5].
     Hours before the pkl start are clamped to the first available value.
     Returns (v_hist, era_env) where era_env is None if the pkl lacks scalars.
     """
@@ -258,7 +273,7 @@ def _load_bt_history(bt_pkl, ref_time, hours=48):
                 vp_a = evp.reindex(win).to_numpy(float)
                 chi_a = ech.reindex(win).to_numpy(float)
                 s_a = esh.reindex(win).to_numpy(float)
-                chi_a = np.clip(np.nan_to_num(chi_a, nan=1e-10) * 5.0, 0.0, 4.0)
+                chi_a = _chi_calibrated_lin(np.nan_to_num(chi_a, nan=1e-10))
                 if len(win) < n_hist:              # clamp earliest hours
                     pad = n_hist - len(win)
                     vp_a = np.concatenate([np.full(pad, vp_a[0]), vp_a])
@@ -373,7 +388,7 @@ def _run_member(task):
                 'bathymetry': bathy, 'is_land': is_land, 'rh_mid': None,
             }
 
-    fast = Fast(env_provider=PrecomputedEnv(), track_provider=BTTrack(), h_bl=1000.0)
+    fast = Fast(env_provider=PrecomputedEnv(), track_provider=BTTrack(), h_bl=H_BL)
     t_max_s = (n_pt - 1) * 3600.0
     t_eval = np.arange(n_pt, dtype=float) * 3600.0
 
@@ -432,7 +447,7 @@ def _run_member(task):
                     Vtar[k], env0['h_m'], vp_r[k], (uT0, 0.0), env0['bathymetry'],
                     env0['t_strat']), 0.0, 1.0))
             gamma_r = np.array([compute_gamma(a, _EPS, _KAP) for a in alpha_r])
-            coeff0 = 0.5 * C_K / 1000.0 * 3600.0       # per-hour rate, h_bl=1000
+            coeff0 = 0.5 * C_K / H_BL * 3600.0       # per-hour rate
             # m0 from local tendency (calculate_m0 in run_fast_reference)
             v0 = float(Vtar[-1])
             dvdt0 = float(Vtar[-1] - Vtar[-2])
@@ -474,7 +489,7 @@ def _run_member(task):
                 # diagnostic only; no forecast-phase forcing applied)
                 solver = Fast
             ffast = solver(env_provider=PrecomputedEnv(), track_provider=BTTrack(),
-                           h_bl=1000.0)
+                           h_bl=H_BL)
             sol = ffast.run(t_span=(0, t_max_s), y0=y0, t_eval=t_eval,
                             method='RK45', max_step=3600, rtol=1e-4, atol=1e-6)
             f_diag = dict(v0_kts=float(v0 * 1.94384), m0=m, F=F_init,
@@ -526,7 +541,7 @@ def _run_member(task):
             Vtar2 = np.interp(np.arange(n_glue), ix, Vtar2[ix])
             Vr = float(Vtar2[0])
             mr = float(np.clip(y0[3] if np.ndim(y0) else 0.4, 0.01, 1.0))
-            coeff0 = 0.5 * C_K / 1000.0 * 3600.0
+            coeff0 = 0.5 * C_K / H_BL * 3600.0
             # ocean coupling alpha at the member's own hourly positions
             alpha_seq = np.empty(n_glue); gamma_seq = np.empty(n_glue)
             for k in range(n_glue):
@@ -556,7 +571,7 @@ def _run_member(task):
                     d[2] += (F_rel / 3600.0) * np.exp(-(lead_h / 24.0) ** 2)
                     return d
             rfast = ReleasedFast(env_provider=PrecomputedEnv(), track_provider=BTTrack(),
-                                 h_bl=1000.0)
+                                 h_bl=H_BL)
             y0r = np.array([lon[h_rel], lat[h_rel], Vr, mr], float)
             sol2 = rfast.run(t_span=(h_rel * 3600.0, t_max_s), y0=y0r,
                              t_eval=np.arange(h_rel, n_pt) * 3600.0,

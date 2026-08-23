@@ -49,7 +49,7 @@ class ConstantEnvProvider(BaseEnvProvider):
     env_wind_profile: Sequence[float]
     bathymetry: float
 
-    def __init__(self, v_pot: float = 80.0, h_m: float = 50.0, t_strat: float = 0.2, chi: float = 0.5, C_k: float = 0.0015, env_wind_profile: Sequence[float] = (5.0, 0.0, 0.0, 0.0), bathymetry: float = -5000.0):
+    def __init__(self, v_pot: float = 80.0, h_m: float = 50.0, t_strat: float = 0.2, chi: float = 0.5, C_k: float = 1.2e-3, env_wind_profile: Sequence[float] = (5.0, 0.0, 0.0, 0.0), bathymetry: float = -5000.0):
         self.v_pot = float(v_pot)
         self.h_m = float(h_m)
         self.t_strat = float(t_strat)
@@ -635,7 +635,10 @@ class ERA5EnvProvider(BaseEnvProvider):
             # Calculate v_pot and chi
             try:
                 v_pot = self.compute_vpot(sst, sp, t_full, q_full, p_full)
-                chi = 0.4 * self.compute_chi(sst, sp, t_mid, p_mid, q_mid)
+                # compute_chi_simple already applies the Lin et al. calibration
+                # chi = exp(log(chi_grid) + 0.5) + 1.3 (Table A1); the old extra
+                # 0.4 factor was a local hack and is retired.
+                chi = self.compute_chi(sst, sp, t_mid, p_mid, q_mid)
                 rh_mid = float(self._estimate_rh(t_mid, q_mid, p_mid))
             except Exception:
                 return 0.0, 0.5, None
@@ -694,7 +697,7 @@ class ERA5EnvProvider(BaseEnvProvider):
                 "h_m": 50.0,
                 "t_strat": 0.2,
                 "chi": 0.5,
-                "C_k": 0.0015,
+                "C_k": 1.2e-3,
                 "env_wind_profile": (0.0, 0.0, 0.0, 0.0),
                 "bathymetry": -5000.0,
                 "is_land": False
@@ -760,7 +763,7 @@ class ERA5EnvProvider(BaseEnvProvider):
             "h_m": float(h_m),
             "t_strat": float(t_strat),
             "chi": float(chi),
-            "C_k": 0.0015,  # Can be made variable
+            "C_k": 1.2e-3,  # Lin namelist Ck (was 0.0015); pair with h_bl=1400
             "env_wind_profile": env_wind_profile,
             "bathymetry": float(bathymetry),
             "is_land": is_land,

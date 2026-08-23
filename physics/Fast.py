@@ -21,14 +21,16 @@ class Fast:
     """
     FAST model class for tropical cyclone intensity and track prediction
     """
-    def __init__(self, env_provider: BaseEnvProvider, track_provider: Track, h_bl: float=1000.0):
+    def __init__(self, env_provider: BaseEnvProvider, track_provider: Track, h_bl: float=1400.0):
         """
         Initialize FAST model
-        
+
         Args:
             env_provider: Environment data provider (e.g., ConstantEnvProvider)
             track_provider: Track velocity provider (e.g., RandomTrack)
-            h_bl: Boundary layer depth in meters (default: 1000.0)
+            h_bl: Boundary layer depth in meters. Default 1400 m for the NA
+                basin, matching Lin et al. namelist atm_bl_depth['NA'] and
+                Ck = 1.2e-3 (the Ck/h pair must be changed together).
         """
         self.env_provider = env_provider
         self.track_provider = track_provider

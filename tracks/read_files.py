@@ -1,32 +1,35 @@
-"""Read ECMWF 51-member ensemble TC tracks from TIGGE XML (2023-2025 NA storms).
+"""Read parent ensemble TC tracks from TIGGE for arbitrary (storm, cycle).
 
-For each auto-discovered storm we scan the TIGGE base times around genesis and
-pick the cycle (base time) whose ensemble contains the MOST members tracking the
-named storm -- that base time becomes the storm's init_time. The 51 (<=51)
-ensemble member tracks for that cycle are saved as a raw pickle.
+Two sources (selected via config.txt track_source):
+  ECMWF: TIGGE XML cyclone products, 51 members
+         /global/cfs/cdirs/m5011/Jay/TIGGE/ecmf/{year}/{YYYYMMDD}/*.xml
+  GEFS : vortex tracking from pgrb2a GRIB2 (tracks/gefs_tracks.py)
 
-Data layout: /global/cfs/cdirs/m5011/Jay/ECMF/{year}/{YYYYMMDD}/z_tigge_c_ecmf_*.xml
+A "case" is one storm at one ensemble cycle (base time). For each case we
+write tracks/processed/{storm}/{YYYYMMDDHH}/raw.pkl.
+
+Init-time policy (FHLO paper): run every 0000/1200 UTC cycle during the
+storm's best-track lifetime that yields >= MIN_MEMBERS parent members.
 """
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from datetime import datetime, timedelta
 import pickle
 import re
+import sys
 import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
+from pathlib import Path
+
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from config import (
-    ECMWF_BASE_DIR, PROCESSED_TRACKS_DIR, ALL_STORMS, MIN_MEMBERS,
+    ECMWF_BASE_DIR, PROCESSED_TRACKS_DIR, MIN_MEMBERS,
+    discover_storms, storm_dir_name,
 )
-import config as _cfg          # live reference: INIT_SEARCH_* mutable at runtime
 
 
 def _parse_dt(text):
-    """Parse CXML time; tolerant of optional trailing 'Z' (2017 has Z, 2024 doesn't)."""
+    """Parse CXML time; tolerant of optional trailing 'Z' (2017 has Z)."""
     if not text:
         return None
     s = text.strip().rstrip("Z")
@@ -37,7 +40,13 @@ def _parse_dt(text):
 
 
 def parse_tigge_xml(fp: Path, storm_name: str, base_time_filter: datetime = None):
-    """Parse one TIGGE XML; return ensemble-member tracks of the named storm."""
+    """Parse one TIGGE XML; return ensemble-member tracks of the named storm.
+
+    Longitude/latitude conventions differ between TIGGE generations:
+      2023+ : units='N'/'W' with SIGNED values
+      2017-22: units='deg N'/'deg W' with unsigned magnitudes
+    Hemisphere indicated by units OR a trailing letter forces the sign.
+    """
     tracks = []
     try:
         root = ET.parse(fp).getroot()
@@ -68,29 +77,39 @@ def parse_tigge_xml(fp: Path, storm_name: str, base_time_filter: datetime = None
                 num_e = dist.find("cycloneNumber")
                 cyclone_num = None
                 if num_e is not None and num_e.text:
-                    digits = re.sub(r"\D", "", num_e.text)  # '02L' -> '02'
+                    digits = re.sub(r"\D", "", num_e.text)
                     cyclone_num = int(digits) if digits else None
                 bas_e = dist.find("basin")
                 basin = bas_e.text.strip() if bas_e is not None and bas_e.text else None
 
                 lon_list, lat_list, time_list = [], [], []
                 for fix in dist.findall("fix"):
-                    lat_e, lon_e, time_e = fix.find("latitude"), fix.find("longitude"), fix.find("validTime")
+                    lat_e = fix.find("latitude")
+                    lon_e = fix.find("longitude")
+                    time_e = fix.find("validTime")
                     if lat_e is None or lon_e is None:
                         continue
                     try:
-                        lat_v = float(lat_e.text.strip().rstrip("NS"))
-                        if lat_e.text.upper().endswith("S") or (lat_e.get("units") or "").upper() == "S":
+                        lat_txt = lat_e.text.strip()
+                        lat_units = (lat_e.get("units") or "").upper()
+                        south = lat_txt.upper().endswith("S") or "S" in lat_units
+                        lat_v = float(lat_txt.rstrip("NSns"))
+                        if south and lat_v > 0:
                             lat_v = -lat_v
-                        lon_v = float(lon_e.text.strip().rstrip("EW"))
-                        if lon_e.text.upper().endswith("W") or (lon_e.get("units") or "").upper() == "W":
+                        lon_txt = lon_e.text.strip()
+                        lon_units = (lon_e.get("units") or "").upper()
+                        west = lon_txt.upper().endswith("W") or "W" in lon_units
+                        lon_v = float(lon_txt.rstrip("EWew"))
+                        if west and lon_v > 0:
                             lon_v = -lon_v
                         lon_v = ((lon_v + 180) % 360) - 180
                         fix_time = base_time
                         if time_e is not None and time_e.text:
                             fix_time = _parse_dt(time_e.text) or base_time
                         if fix_time:
-                            lon_list.append(lon_v); lat_list.append(lat_v); time_list.append(fix_time)
+                            lon_list.append(lon_v)
+                            lat_list.append(lat_v)
+                            time_list.append(fix_time)
                     except Exception:
                         continue
                 if len(lon_list) >= 2:
@@ -101,188 +120,137 @@ def parse_tigge_xml(fp: Path, storm_name: str, base_time_filter: datetime = None
                         "lon": np.array(lon_list), "lat": np.array(lat_list),
                         "datetime": time_list,
                     })
-    except Exception as e:
+    except Exception:
         return [], None
     return tracks, base_time
 
 
-def _candidate_xml_files(year, genesis):
-    """All TIGGE XML files whose date dir is within the init search window."""
-    ydir = ECMWF_BASE_DIR / str(year)
-    if not ydir.is_dir():
+def candidate_cycles(storm, source="ecmwf", base_dir=None):
+    """All 00/12 UTC cycles during the storm's BT lifetime, newest-first not
+    needed; returns sorted list of datetimes."""
+    t0, t1 = storm["genesis"], storm["last_time"]
+    cycles = []
+    t = datetime(t0.year, t0.month, t0.day)
+    while t <= t1:
+        for hh in (0, 12):
+            cyc = t + timedelta(hours=hh)
+            if t0 <= cyc <= t1:
+                cycles.append(cyc)
+        t += timedelta(days=1)
+    return cycles
+
+
+def _ecmwf_xml_for_cycle(year, cycle, base_dir=None):
+    ddir = (base_dir or ECMWF_BASE_DIR) / str(year) / cycle.strftime("%Y%m%d")
+    if not ddir.is_dir():
         return []
-    start = (genesis - timedelta(days=_cfg.INIT_SEARCH_LEAD_DAYS)).date()
-    end = (genesis + timedelta(days=_cfg.INIT_SEARCH_TAIL_DAYS)).date()
-    files = []
-    d = start
-    while d <= end:
-        ddir = ydir / d.strftime("%Y%m%d")
-        if ddir.is_dir():
-            files.extend(sorted(ddir.glob("*.xml")))
-        d += timedelta(days=1)
-    return files
+    return sorted(ddir.glob("*.xml"))
 
 
-def _candidate_xml_files_center(year, genesis, center="ecmf", base_dir=None):
-    """TIGGE XML files for a given producing center within the init window.
-
-    center='ecmf': {base}/ECMF/{year}/{YYYYMMDD}/z_tigge_c_ecmf_*.xml  (51 members)
-    center='kwbc': {base}/KWBC/{year}/{YYYYMMDD}/z_tigge_c_kwbc_*_GEFS_*.xml
-                   (NCEP GEFS ensemble tracks; also CENS/CMC/GFS products exist,
-                   filtered to GEFS only). FHLO's GEFS track source.
-    """
-    base_dir = Path(base_dir) if base_dir else ECMWF_BASE_DIR
-    root = base_dir / str(year)          # base_dir already points at the
-    if not root.is_dir():                # center dir (…/TIGGE/ecmf or …/TIGGE/kwbc)
-        return []
-    start = (genesis - timedelta(days=_cfg.INIT_SEARCH_LEAD_DAYS)).date()
-    end = (genesis + timedelta(days=_cfg.INIT_SEARCH_TAIL_DAYS)).date()
-    files = []
-    d = start
-    while d <= end:
-        ddir = root / d.strftime("%Y%m%d")
-        if ddir.is_dir():
-            if center == "kwbc":
-                files.extend(sorted(ddir.glob("z_tigge_c_kwbc_*_GEFS_*.xml")))
-            else:
-                files.extend(sorted(ddir.glob("*.xml")))
-        d += timedelta(days=1)
-    return files
-
-
-def read_storm_ensemble_center(storm_cfg: dict, center="ecmf", base_dir=None,
-                               min_members=None, save_dir=None):
-    """read_storm_ensemble generalized to a producing center (ecmf | kwbc/GEFS).
-
-    kwbc GEFS XMLs use the same CXML schema; member ids 0..30 (31 members,
-    control + 30 perturbed). Output raw.pkl identical to the ecmf path, with
-    ensemble_system=center and parent_member set for member-paired sampling.
-    """
-    storm = storm_cfg["storm_name"]
-    year = storm_cfg["year"]
-    genesis = storm_cfg["genesis"]
+def read_case_ecmwf(storm, cycle, min_members=None, save=True):
+    """Load one (storm, cycle) case from TIGGE XML; write raw.pkl."""
     min_members = min_members or MIN_MEMBERS
-
-    per_base = {}
-    for fp in _candidate_xml_files_center(year, genesis, center=center,
-                                          base_dir=base_dir):
-        trks, base_time = parse_tigge_xml(fp, storm)
-        if base_time is None:
+    members = {}
+    for fp in _ecmwf_xml_for_cycle(storm["year"], cycle):
+        trks, base_time = parse_tigge_xml(fp, storm["storm_name"],
+                                          base_time_filter=cycle)
+        if base_time is None or not trks:
             continue
-        slot = per_base.setdefault(base_time, {})
         for tr in trks:
             mid = tr["member_id"]
-            if mid not in slot or len(tr["lon"]) > len(slot[mid]["lon"]):
-                slot[mid] = tr
-
-    if not per_base:
-        print(f"  [SKIP] {storm} ({year}): no {center} TIGGE tracks near genesis "
-              f"{genesis:%Y-%m-%d}")
-        return None
-
-    best_base = max(per_base, key=lambda b: len(per_base[b]))
-    members = per_base[best_base]
+            if mid not in members or len(tr["lon"]) > len(members[mid]["lon"]):
+                members[mid] = tr
     if len(members) < min_members:
-        print(f"  [SKIP] {storm} ({year}): best {center} cycle {best_base:%Y-%m-%d %Hz} "
-              f"has only {len(members)} members (<{min_members})")
         return None
-
     tracks = []
-    for mid in sorted(members.keys()):
+    for mid in sorted(members):
         tr = dict(members[mid])
-        tr["ensemble_system"] = center
-        # parent attribution for member-paired sampling (FHLO inheritance)
-        tr["parent_member"] = ("c00" if mid == 0 else f"p{mid:02d}") \
-            if center == "kwbc" else f"e{mid:02d}"
+        tr["parent_member"] = f"e{mid:02d}"
         tracks.append(tr)
+    return _package_case(storm, cycle, tracks, "ecmwf", save)
 
+
+def _package_case(storm, cycle, tracks, source, save=True):
     times = [t["datetime"] for t in tracks if t.get("datetime")]
-    print(f"  {storm} ({year}) [{center}]: init={best_base:%Y-%m-%d %Hz}, "
-          f"{len(tracks)} ensemble members")
-
     result = {
-        "storm_config": {**storm_cfg, "forced_init_time": best_base},
-        "tracks": tracks, "n_tracks": len(tracks),
+        "storm_config": {**storm, "forced_init_time": cycle},
+        "tracks": tracks,
+        "n_tracks": len(tracks),
         "time_range": {
-            "init_time": min(min(tt) for tt in times) if times else best_base,
-            "end_time": max(max(tt) for tt in times) if times else best_base,
+            "init_time": min(min(tt) for tt in times) if times else cycle,
+            "end_time": max(max(tt) for tt in times) if times else cycle,
         },
-        "forced_init_time": best_base,
-        "ensemble_systems": [center],
+        "forced_init_time": cycle,
+        "ensemble_systems": [source],
     }
-    out_dir = Path(save_dir) if save_dir else PROCESSED_TRACKS_DIR
-    out_dir = out_dir / storm.lower()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_file = out_dir / f"{storm.lower()}_{best_base:%Y%m%dT%H%M%S}_raw.pkl"
-    with open(out_file, "wb") as f:
-        pickle.dump(result, f)
+    if save:
+        out_dir = case_dir(storm["storm_name"], storm["year"], cycle)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        with open(out_dir / "raw.pkl", "wb") as f:
+            pickle.dump(result, f)
     return result
 
 
-def read_storm_ensemble(storm_cfg: dict):
-    """Find best init cycle for a storm and save its 51-member ensemble."""
-    storm = storm_cfg["storm_name"]
-    year = storm_cfg["year"]
-    genesis = storm_cfg["genesis"]
+def case_dir(storm_name: str, year, cycle: datetime) -> Path:
+    """tracks/processed/{name}_{year}/{YYYYMMDDHH}"""
+    return PROCESSED_TRACKS_DIR / storm_dir_name(storm_name, year) \
+        / cycle.strftime("%Y%m%d%H")
 
-    # 1) scan candidate base times -> count members per base time
-    per_base = {}   # base_time -> {member_id: track}
-    for fp in _candidate_xml_files(year, genesis):
-        trks, base_time = parse_tigge_xml(fp, storm)
-        if base_time is None:
-            continue
-        slot = per_base.setdefault(base_time, {})
-        for tr in trks:
-            mid = tr["member_id"]
-            if mid not in slot or len(tr["lon"]) > len(slot[mid]["lon"]):
-                slot[mid] = tr
 
-    if not per_base:
-        print(f"  [SKIP] {storm} ({year}): no TIGGE tracks near genesis {genesis:%Y-%m-%d}")
+# ── GEFS source ───────────────────────────────────────────────────────────────
+def read_case_gefs(storm, cycle, min_members=None, save=True):
+    """Load one (storm, cycle) from GEFS GRIB2 vortex tracking."""
+    import gefs_tracks as gt
+    min_members = min_members or MIN_MEMBERS
+    # gefs_tracks.extract_gefs_tracks expects a case_dir + bt csv; locate by date
+    case_root = gt.GFS_ROOT / str(storm["year"]) / cycle.strftime("%Y%m%d%H")
+    if not case_root.is_dir():
         return None
-
-    # 2) pick base time with the most members
-    best_base = max(per_base, key=lambda b: len(per_base[b]))
-    members = per_base[best_base]
-    if len(members) < MIN_MEMBERS:
-        print(f"  [SKIP] {storm} ({year}): best cycle {best_base:%Y-%m-%d %Hz} "
-              f"has only {len(members)} members (<{MIN_MEMBERS})")
+    bt_csv = Path(storm["storm_dir"]) / "track_intensity_6h.csv"
+    result = gt.extract_gefs_tracks(case_root, bt_csv,
+                                    min_members=min_members)
+    if result is None or result.get("n_tracks", 0) < min_members:
         return None
-
-    tracks = [members[k] for k in sorted(members.keys())]
-    times = [t["datetime"] for t in tracks if t.get("datetime")]
-    print(f"  {storm} ({year}): init={best_base:%Y-%m-%d %Hz}, "
-          f"{len(tracks)} ensemble members")
-
-    result = {
-        "storm_config": {**storm_cfg, "forced_init_time": best_base},
-        "tracks": tracks, "n_tracks": len(tracks),
-        "time_range": {
-            "init_time": min(min(tt) for tt in times) if times else best_base,
-            "end_time": max(max(tt) for tt in times) if times else best_base,
-        },
-        "forced_init_time": best_base,
-        "ensemble_systems": ["ecmwf"],
-    }
-
-    out_dir = PROCESSED_TRACKS_DIR / storm.lower()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_file = out_dir / f"{storm.lower()}_{best_base:%Y%m%dT%H%M%S}_raw.pkl"
-    with open(out_file, "wb") as f:
-        pickle.dump(result, f)
-    return result
+    # normalize to the shared package layout
+    tracks = result["tracks"]
+    for tr in tracks:
+        tr["init_time"] = cycle
+    return _package_case(storm, cycle, tracks, "gefs", save)
 
 
-def run_read_tracks(storms=None):
-    storm_list = storms or ALL_STORMS
-    results = {}
-    for cfg in storm_list:
-        r = read_storm_ensemble(cfg)
-        if r:
-            results[cfg["storm_name"]] = r
-    print(f"\n=== read_tracks: {len(results)}/{len(storm_list)} storms have ensembles ===")
-    return results
+def read_case(storm, cycle, source="ecmwf", **kw):
+    """Dispatch to the configured source for one (storm, cycle) case."""
+    if source == "gefs":
+        return read_case_gefs(storm, cycle, **kw)
+    return read_case_ecmwf(storm, cycle, **kw)
+
+
+def run_read_cases(storms=None, source="ecmwf", init_times=None):
+    """Read all cycles for each storm. init_times: {storm_name: [dt,...]}
+    to override the auto cycle list (e.g. paper case Irma 2017-09-05 00Z)."""
+    storms = storms or discover_storms()
+    n_ok = 0
+    for storm in storms:
+        cycles = (init_times or {}).get(storm["storm_name"]) \
+            or candidate_cycles(storm, source)
+        for cyc in cycles:
+            r = read_case(storm, cyc, source=source)
+            if r:
+                n_ok += 1
+                print(f"  {storm['storm_name']} {cyc:%Y-%m-%d %HZ} [{source}]: "
+                      f"{r['n_tracks']} members")
+            else:
+                print(f"  [skip] {storm['storm_name']} {cyc:%Y-%m-%d %HZ} "
+                      f"[{source}]: <{MIN_MEMBERS} members")
+    print(f"read_cases: {n_ok} case(s) saved")
+    return n_ok
 
 
 if __name__ == "__main__":
-    run_read_tracks()
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--source", default="ecmwf", choices=["ecmwf", "gefs"])
+    ap.add_argument("--storms", default="", help="comma-separated storm dir names")
+    args = ap.parse_args()
+    flt = [s for s in args.storms.split(",") if s.strip()] or None
+    run_read_cases(discover_storms(storms_filter=flt), source=args.source)

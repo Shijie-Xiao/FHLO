@@ -62,23 +62,20 @@ EPSILON_FAST, KAPPA_FAST = 0.33, 0.1
 BETA_FAST = 1.0 - EPSILON_FAST - KAPPA_FAST
 Rd, Rv, Lv = 287.04, 461.5, 2.5e6
 EPS_H2O = Rd / Rv
-CHI_D = 4.0
+CHI_D = 5.0
+# Lin et al. official chi handling: raw chi clipped to [0, 10] at field
+# computation (thermo/calc_thermo.py); the exp(log+0.5)+1.3 calibration is
+# applied downstream (physics calibration stage), NOT here.
 CHI_PARAMS = {
     'NA': {'percentile': 90, 'renv_km': 1000},
     'EP': {'percentile': 50, 'renv_km': 900},
 }
 
-ERA5_ROOT = '/global/cfs/cdirs/m5011/Jay/ERA5'
-# Local flat layout shipped with the repo (data/ is gitignored):
-#   data/era5/{T,Q,U,V}_{YYYYMMDD}.nc   (daily PL, 30 levels, REGIONAL crop)
-#   data/era5/{SSTK,MSL,BLH}_{YYYYMM}.nc (monthly SFC, REGIONAL crop)
 # NOTE: local data is time-cropped with the FULL spatial domain kept
 # (lat 0-80N, lon 0-360E), produced by download/crop_beryl_sample.py.
 # The pipeline reads ONLY local data (demo-shippable); the CFS archive is
 # used exclusively by the crop script.
-LOCAL_ERA5_ROOT = PROJECT_ROOT / 'data' / 'era5'
-LOCAL_OISST_ROOT = PROJECT_ROOT / 'data' / 'oisst'
-CFS_ERA5_ROOT = Path(ERA5_ROOT)
+# Paths are resolved in _cfg_overrides() below (config.txt > env > default).
 SUPPORTED_BASINS = ('NA', 'EP')
 TIME_TOLERANCE = pd.Timedelta(minutes=30)
 
@@ -89,11 +86,43 @@ SFC_VAR_CODE = {'SSTK': '034_sstk', 'MSL': '151_msl'}
 
 
 # ---------- Config ----------
+def _cfg_overrides():
+    """Read path overrides from FHLO/config.txt (lowercase keys)."""
+    cfg = {}
+    p = PROJECT_ROOT / 'config.txt'
+    if p.exists():
+        for line in p.read_text(encoding='utf-8').splitlines():
+            s = line.strip()
+            if not s or s.startswith('#') or '=' not in s:
+                continue
+            k, v = [x.strip() for x in s.split('=', 1)]
+            cfg[k.lower()] = v
+    return cfg
+
+
+_CFG = _cfg_overrides()
+# Path precedence: config.txt overrides > env var > built-in default.
+#   era5_root  : CFS archive root (used when era5_root is passed explicitly,
+#                or by download/crop scripts); local flat data stays data/era5
+#   era5_dir   : local ERA5 crop dir actually read by the pipeline
+#   oisst_root : CFS OISST archive (crop scripts)
+#   oisst_dir  : local OISST crop dir actually read by the pipeline
+ERA5_ROOT = _CFG.get('era5_root') or os.environ.get('FHLO_ERA5_ROOT') \
+    or '/global/cfs/cdirs/m5011/Jay/ERA5'
+LOCAL_ERA5_ROOT = Path(_CFG.get('era5_dir') or os.environ.get('FHLO_ERA5_DIR')
+                       or PROJECT_ROOT / 'data' / 'era5')
+LOCAL_OISST_ROOT = Path(_CFG.get('oisst_dir') or os.environ.get('FHLO_OISST_DIR')
+                        or PROJECT_ROOT / 'data' / 'oisst')
+CFS_ERA5_ROOT = Path(ERA5_ROOT)
+
+
 def load_config(path: Path):
+    """Full config dict for the CLI (defaults + config.txt overrides)."""
     cfg = {'basins': 'ALL', 'year_start': '2003', 'year_end': '2024',
-           'output_dir': 'data/ibtracs', 'era5_root': '',
+           'output_dir': 'data/ibtracs', 'era5_root': ERA5_ROOT,
            'sst_source': 'ERA5', 'env_source': 'ERA5', 'track_source': 'ECMWF',
-           'oisst_dir': str(LOCAL_OISST_ROOT), 'n_workers': '4'}
+           'era5_dir': str(LOCAL_ERA5_ROOT), 'oisst_dir': str(LOCAL_OISST_ROOT),
+           'n_workers': '4'}
     if path.exists():
         for line in path.read_text(encoding='utf-8').splitlines():
             s = line.strip()
@@ -528,7 +557,8 @@ def _calc_fast_params_dynamic(Ts_K, To_K, Ps_Pa, alpha_dyn):
 def calc_chi(sst, psl, T_mid, p_mid, r_mid):
     """Chi (饱和熵亏) from thermo.sat_deficit -- EXACT port of ODE/training prep.
     chi = (sps-sp)/(spss-sps); 分母为海表不平衡 (spss-sps)。
-    分母失效(冷水/陆上, chi<=0 或 NaN) 时设为物理上限 CHI_D=4.0, 绝不设 0。
+    分母失效(冷水/陆上, chi<=0 或 NaN) 时设为物理上限 CHI_D, 绝不设 0
+    (Lin et al. util/compute.py 对 NaN 同样填 5)。
     输入 T_mid/r_mid 为 annulus(200-800km) 环平均中层值 (与 s_ref 同口径)。"""
     if np.isnan(sst):
         sst = 273.15

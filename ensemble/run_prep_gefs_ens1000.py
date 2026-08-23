@@ -27,9 +27,28 @@ sys.path.insert(0, str(_THIS.parent))  # PINN/ root
 
 from prepare_ensemble_storm import _load_best_track, _load_synthetic, _build_member_track
 
-# --- Config (env-overridable) ---
-CASE_DIR    = Path(os.environ.get('GEFS_CASE_DIR',
-    '/global/cfs/cdirs/m5011/Jay/ERA5/GFS/2025_ERIN_NA'))
+
+def _cfg_overrides():
+    """Read path overrides from FHLO/config.txt (lowercase keys)."""
+    cfg = {}
+    p = _THIS.parent / 'config.txt'
+    if p.exists():
+        for line in p.read_text(encoding='utf-8').splitlines():
+            s = line.strip()
+            if not s or s.startswith('#') or '=' not in s:
+                continue
+            k, v = s.split('=', 1)
+            cfg[k.strip().lower()] = v.strip()
+    return cfg
+
+
+_CFG = _cfg_overrides()
+_GEFS_ROOT = _CFG.get('gefs_root', '/global/cfs/cdirs/m5011/Jay/ERA5/GFS')
+
+# --- Config (env-overridable; env > config.txt > hardcoded default) ---
+CASE_DIR    = Path(os.environ.get('GEFS_CASE_DIR')
+                   or _CFG.get('gefs_case_dir')
+                   or f'{_GEFS_ROOT}/2025_ERIN_NA')
 INIT_TIME   = os.environ.get('GEFS_INIT_TIME', '2025-08-11 12:00')  # match ECMWF TIGGE
 SYNTH_NC    = os.environ.get('PREP_SYNTH_NC',
     '/pscratch/sd/s/sixao74/Deepmind/PINN/ensemble_tracks/erin/synthetic_tracks_1000members.nc')

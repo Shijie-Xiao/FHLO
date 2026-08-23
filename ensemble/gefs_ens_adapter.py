@@ -39,9 +39,30 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-GFS_ROOT = Path('/global/cfs/cdirs/m5011/Jay/ERA5/GFS')
-ERA5_ROOT = Path('/global/cfs/cdirs/m5011/Jay/ERA5')
-_NC_CACHE = Path('/pscratch/sd/s/sixao74/Deepmind/PINN/_gefs_nc')
+def _cfg_overrides():
+    """Read path overrides from FHLO/config.txt (lowercase keys)."""
+    import os
+    cfg = {}
+    p = Path(__file__).resolve().parent.parent / 'config.txt'
+    if p.exists():
+        for line in p.read_text(encoding='utf-8').splitlines():
+            s = line.strip()
+            if not s or s.startswith('#') or '=' not in s:
+                continue
+            k, v = s.split('=', 1)
+            cfg[k.strip().lower()] = v.strip()
+    return cfg
+
+
+_CFG = _cfg_overrides()
+# GEFS GRIB2 archive, ERA5 archive, and the cfgrib->NetCDF cache dir.
+# Precedence: config.txt (gefs_root / era5_root / gefs_cache_dir) > env > default.
+GFS_ROOT = Path(_CFG.get('gefs_root') or os.environ.get('FHLO_GEFS_ROOT')
+                or '/global/cfs/cdirs/m5011/Jay/ERA5/GFS')
+ERA5_ROOT = Path(_CFG.get('era5_root') or os.environ.get('FHLO_ERA5_ROOT')
+                 or '/global/cfs/cdirs/m5011/Jay/ERA5')
+_NC_CACHE = Path(_CFG.get('gefs_cache_dir') or os.environ.get('FHLO_GEFS_CACHE')
+                 or Path(__file__).resolve().parent.parent / 'data' / 'gefs_nc_cache')
 _NC_CACHE.mkdir(parents=True, exist_ok=True)
 
 # `PL_LEVELS` is for spatial_3d (7 levels consumed by ML/FAST models).

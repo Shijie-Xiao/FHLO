@@ -27,8 +27,12 @@ import pandas as pd
 MS_TO_KNOTS = 1.94384
 XS_NAN_FALLBACK = 1e-5
 STEP_SIZE = 1.0 / 4.0
-CHI_D = 4.0
-CHI_MULTIPLIER = 5
+CHI_D = 5.0
+# Lin et al. official chi calibration (tropical_cyclone_risk namelist +
+# util/compute.py): chi_eff = clip(exp(log(chi+1e-3) + log_chi_fac) + chi_fac,
+# 1e-5, 5) with log_chi_fac=0.5, chi_fac=1.3. Replaces clip(chi*5, 0, 4).
+LOG_CHI_FAC = 0.5
+CHI_FAC = 1.3
 VMAX_START_MS = 45 * 0.514444
 INIT_HOURS = 48
 T0_DECAY_HOURS = 24.0
@@ -56,9 +60,11 @@ def _median_filter(arr, size=3):
 
 
 def _chi_calibrated(chi_val):
+    """Lin et al. calibration: chi_eff = clip(exp(log(chi+1e-3)+0.5)+1.3, 1e-5, CHI_D)."""
     chi_val = np.asarray(chi_val, dtype=np.float64)
     chi_val = np.maximum(np.nan_to_num(chi_val, nan=1e-10), 1e-10)
-    return np.clip(chi_val * CHI_MULTIPLIER, 0.0, CHI_D)
+    chi_eff = np.exp(np.log(chi_val + 1e-3) + LOG_CHI_FAC) + CHI_FAC
+    return np.clip(chi_eff, 1e-5, CHI_D)
 
 
 # ---------- FAST ODE ----------

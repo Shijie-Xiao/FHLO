@@ -1,10 +1,33 @@
+# ---- Python ----
 __pycache__/
 *.py[cod]
 *.egg-info/
 .DS_Store
 .ipynb_checkpoints/
 
-# Data & download scripts (not synced)
+# ---- Local data (time-cropped ERA5/OISST/GEFS/IBTrACS inputs; gitignored) ----
 data/
-download/
+
+# ---- Pipeline outputs (regenerable; never upload) ----
+# synthetic-track cases: tracks/processed/{storm}_{year}/{cycle}/
+tracks/processed/
+# FAST reference outputs written next to the pkl (csv/png per storm)
+data/ibtracs/**/fast_reference*
+# ensemble outputs (dataset.pkl / chi_s.nc / ode.nc trees)
+ensemble_data/
+ensemble/out/
+# GEFS cfgrib->NetCDF cache
+data/gefs_nc_cache/
+
+# ---- Static precomputed fields (tracked on purpose: small, slow to rebuild) ----
+# precalc_data/
+
+# ---- Logs & scratch ----
 logs/
+*.log
+download/*.log
+
+# ---- Editor / OS ----
+.vscode/
+.idea/
+*.swp

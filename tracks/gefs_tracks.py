@@ -31,9 +31,10 @@ from scipy.ndimage import gaussian_filter
 THIS = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS))
 
-from config import Earth_Radius, MIN_MEMBERS  # noqa: E402
+from config import Earth_Radius, MIN_MEMBERS, GEFS_BASE_DIR  # noqa: E402
 
-GFS_ROOT = Path("/global/cfs/cdirs/m5011/Jay/ERA5/GFS")
+# GEFS GRIB2 archive root (config.txt gefs_root > env FHLO_GEFS_ROOT > default)
+GFS_ROOT = GEFS_BASE_DIR
 VORT_MIN = 1e-5
 SEARCH_INIT = 10.0
 SEARCH_CONT = 8.0

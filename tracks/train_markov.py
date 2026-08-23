@@ -1,19 +1,24 @@
-"""Train Markov model on 6h velocity pairs.
+"""Train per-step Markov conditional Gaussians for each case dir.
 
-Adapted for 2023-2025 NA hurricanes with new ECMWF data paths.
+Verbatim method from Reproduce/track_model/train_markov.py (FHLO paper sec.3a):
+at EACH lead time fit a k=1 Gaussian (single mixture component) to that
+step's P(u_{t-1}, v_{t-1}, u_t, v_t) rows. Time-pooled stationary fits are
+NOT used -- they bias the synthetic mean on recurving storms.
 """
+import pickle
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import pickle
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from config import PROCESSED_TRACKS_DIR
 
 
 def _fit_gaussian(velocity_pairs: np.ndarray):
-    """Fit Gaussian to joint (u_{t-1}, v_{t-1}, u_t, v_t) and compute conditional parameters."""
+    """Fit Gaussian to joint (u_{t-1}, v_{t-1}, u_t, v_t) and compute
+    conditional parameters."""
     mu_joint = np.mean(velocity_pairs, axis=0)
     Sigma_joint = np.cov(velocity_pairs, rowvar=False)
     mu_old, mu_new = mu_joint[:2], mu_joint[2:]
@@ -44,7 +49,7 @@ def _fit_gaussian(velocity_pairs: np.ndarray):
 
 def _fit_per_step(step_indices: np.ndarray, velocity_pairs: np.ndarray,
                   min_samples: int = 5):
-    """Fit per-step Gaussian for each unique step index (legacy, unused)."""
+    """Fit per-step Gaussian for each unique step index."""
     step_params = {}
     for s in np.unique(step_indices):
         pairs_s = velocity_pairs[step_indices == s]
@@ -53,70 +58,60 @@ def _fit_per_step(step_indices: np.ndarray, velocity_pairs: np.ndarray,
     return step_params
 
 
-def _fit_global(velocity_pairs: np.ndarray):
-    """FHLO paper-faithful fit: ONE global joint Gaussian for
-    P(u_{t-1}, v_{t-1}, u_t, v_t) built from ALL ensemble-member
-    displacements (Lin et al. 2020, section 3a: a single k=1 mixture
-    component; stationary Markov chain)."""
-    return _fit_gaussian(velocity_pairs)
+def train_case(case_dir: Path):
+    """pairs_6h.pkl -> markov_params_6h.pkl for one case dir."""
+    pairs_file = case_dir / "pairs_6h.pkl"
+    if not pairs_file.exists():
+        return None
+    with open(pairs_file, "rb") as f:
+        payload = pickle.load(f)
+    velocity_pairs = payload["velocity_pairs"]
+    step_indices = payload.get("step_indices")
+    if step_indices is None or len(step_indices) == 0:
+        return None
+
+    step_params = _fit_per_step(step_indices, velocity_pairs)
+    if not step_params:
+        return None
+
+    first_step = min(step_params.keys())
+    params = {
+        "mu_old": step_params[first_step]["mu_old"],
+        "Sigma_oo": step_params[first_step]["Sigma_oo"],
+        "dt_hours": payload.get("dt_hours", 6.0),
+        "reference_time": payload.get("forced_init_time"),
+        "step_params": step_params,
+        "max_reliable_step": int(step_indices.max()),
+    }
+    with open(case_dir / "markov_params_6h.pkl", "wb") as f:
+        pickle.dump({
+            "storm_config": payload.get("storm_config", {}),
+            "markov_params": params,
+            "velocity_pairs": velocity_pairs,
+            "step_indices": step_indices,
+            "dt_hours": payload.get("dt_hours", 6.0),
+            "reference_time": payload.get("forced_init_time"),
+        }, f)
+    return len(step_params)
 
 
-def run_train_markov():
-    """Train Markov model on 6h velocity pairs for all storms."""
-    if not PROCESSED_TRACKS_DIR.exists():
-        print("[ERROR] Processed tracks dir not found:", PROCESSED_TRACKS_DIR)
-        return
-
-    for storm_dir in sorted(PROCESSED_TRACKS_DIR.iterdir()):
-        if not storm_dir.is_dir():
+def run_train_markov(storm=None):
+    root = PROCESSED_TRACKS_DIR / storm.lower() if storm else PROCESSED_TRACKS_DIR
+    n = 0
+    for case in sorted(root.glob("*/") if storm else root.glob("*/*/")):
+        if not case.is_dir():
             continue
-
-        pairs_file = max(storm_dir.glob("*_*_pairs_6h.pkl"),
-                         key=lambda p: p.stat().st_mtime, default=None)
-        if not pairs_file:
-            continue
-
-        with open(pairs_file, "rb") as f:
-            payload = pickle.load(f)
-
-        velocity_pairs = payload["velocity_pairs"]
-        step_indices = payload.get("step_indices")
-        cfg = payload.get("storm_config", {})
-        ref_time = payload.get("forced_init_time")
-        dt_hours = payload.get("dt_hours", 6.0)
-
-        if step_indices is None or len(step_indices) == 0:
-            continue
-
-        storm_name = cfg.get("storm_name", storm_dir.name)
-        fit = _fit_global(velocity_pairs)
-        params = {
-            "mu_old": fit["mu_old"],
-            "mu_new": fit["mu_new"],
-            "Sigma_oo": fit["Sigma_oo"],
-            "A": fit["A"],
-            "Sigma_cond": fit["Sigma_cond"],
-            "dt_hours": dt_hours,
-            "reference_time": ref_time,
-            "fit_mode": "global",
-            "max_reliable_step": int(step_indices.max()),
-        }
-
-        filename = (f"{storm_name.lower()}_"
-                    f"{ref_time.strftime('%Y%m%dT%H%M%S')}_markov_params_6h.pkl"
-                    if ref_time else "markov_params_6h.pkl")
-        with open(storm_dir / filename, "wb") as f:
-            pickle.dump({
-                "storm_config": cfg,
-                "markov_params": params,
-                "velocity_pairs": velocity_pairs,
-                "step_indices": step_indices,
-                "dt_hours": dt_hours,
-                "reference_time": ref_time,
-            }, f)
-        print(f"  {storm_name}: {len(velocity_pairs)} pairs, "
-              f"global fit, horizon {int(step_indices.max()) * 6}h")
+        r = train_case(case)
+        if r:
+            n += 1
+            print(f"  {case.parent.name}/{case.name}: {r} steps fitted")
+    print(f"train_markov: {n} case(s)")
+    return n
 
 
 if __name__ == "__main__":
-    run_train_markov()
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--storm", default="")
+    args = ap.parse_args()
+    run_train_markov(args.storm or None)

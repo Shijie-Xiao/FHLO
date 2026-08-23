@@ -10,8 +10,12 @@ import numpy as np
 import torch
 
 # 与 run_fast_reference 完全一致
-CHI_MULTIPLIER = 5
-CHI_D_ATLANTIC = 4.0
+# Lin et al. official chi calibration (tropical_cyclone_risk):
+#   chi_eff = clip(exp(log(chi + 1e-3) + log_chi_fac) + chi_fac, 1e-5, 5)
+# with log_chi_fac = 0.5, chi_fac = 1.3 (namelist). Replaces clip(chi*5, 0, 4).
+LOG_CHI_FAC = 0.5
+CHI_FAC = 1.3
+CHI_D_ATLANTIC = 5.0
 XS_NAN_FALLBACK = 1e-5
 STEP_SIZE = 1.0 / 4.0
 VMAX_START_KTS = 45.0
@@ -24,12 +28,12 @@ COEFF_CONST = 0.5 * (1.2e-3 / 1400.0) * 3600.0
 LOSS_TRIM_STEPS = 12
 
 
-def chi_calibrated_torch(chi, chi_multiplier=CHI_MULTIPLIER, chi_max=CHI_D_ATLANTIC):
-    """χ_effective = χ * multiplier，clip 到物理上限。"""
+def chi_calibrated_torch(chi):
+    """χ_effective = clip(exp(log(χ+1e-3)+0.5)+1.3, 1e-5, CHI_D_ATLANTIC)。"""
     chi = torch.nan_to_num(chi, nan=1e-10)
     chi = torch.clamp(chi, min=1e-10)
-    chi_eff = chi * chi_multiplier
-    return torch.clamp(chi_eff, 0.0, chi_max)
+    chi_eff = torch.exp(torch.log(chi + 1e-3) + LOG_CHI_FAC) + CHI_FAC
+    return torch.clamp(chi_eff, 1e-5, CHI_D_ATLANTIC)
 
 
 def _get_coeff_arr_numpy(lons, lats, T):
