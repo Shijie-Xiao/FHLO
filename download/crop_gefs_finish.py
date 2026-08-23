@@ -17,8 +17,11 @@ import xarray as xr
 
 LAT0, LAT1 = 3.5, 48.5
 LON0, LON1 = 258.5, 326.0
-GEFS_ROOT = '/global/cfs/cdirs/m5011/Jay/ERA5/GFS/2024_BERYL_NA/grib2'
-OUT = '/pscratch/sd/s/sixao74/Deepmind/FHLO/data/gefs_beryl'
+# GEFS GRIB2 archive root (override: env FHLO_GEFS_ROOT or config.txt gefs_root)
+GEFS_ROOT = os.environ.get('FHLO_GEFS_ROOT',
+                           '/global/cfs/cdirs/m5011/Jay/ERA5/GFS/2024_BERYL_NA/grib2')
+OUT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                   'data', 'gefs_beryl')
 
 MEMBERS = ['c00'] + [f'p{i:02d}' for i in range(1, 31)]
 FHOURS = list(range(0, 241, 3))
@@ -71,12 +74,12 @@ def crop_member(stream, mem):
 
 
 if __name__ == '__main__':
-    streams = sys.argv[1:] or ['pgrb2b']
-    members = sys.argv[2:] if len(sys.argv) > 2 else None
+    args = sys.argv[1:]
+    streams = [a for a in args if a in ('pgrb2b', 'pgrb2a', 'all')] or ['pgrb2b']
+    members = [a for a in args if a not in ('pgrb2b', 'pgrb2a', 'all')] or None
     for stream in ['pgrb2b', 'pgrb2a']:
-        if stream not in streams and not (len(sys.argv) > 2 and sys.argv[1] == 'all'):
-            if 'all' not in streams and stream not in streams:
-                continue
+        if stream not in streams and 'all' not in streams:
+            continue
         todo = members if members else MEMBERS
         for mem in todo:
             crop_member(stream, mem)
