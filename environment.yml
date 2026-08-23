@@ -1,0 +1,29 @@
+name: fast_ml
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - pandas
+  - scipy
+  - matplotlib
+  - xarray
+  - netcdf4
+  - h5netcdf
+  - bottleneck
+  - dask
+  - tqdm
+  - pyamg
+  - pyshtools
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pip:
+      - setuptools<81
+      - einops>=0.8
+      - wandb>=0.25
+      - tropycal==1.4
+      - tcpypi==1.4
