@@ -75,10 +75,11 @@ def read_cycles_for(storm, cycles_mode="genesis", source="ecmwf",
     return out
 
 
-def run(storms_filter=None, init_overrides=None,
+def run(storms_filter=None, source=None, init_overrides=None,
         cycles="genesis", n_tracks=N_TRACKS, duration_days=DURATION_DAYS,
         plot=False, stages=("read", "pairs", "fit", "sample")):
     cfg = load_project_config()
+    source = (source or cfg.get("track_source", "ECMWF")).lower()
     storms_filter = storms_filter or [
         s for s in cfg.get("storms", "").split(",") if s.strip()]
 
@@ -93,7 +94,6 @@ def run(storms_filter=None, init_overrides=None,
     import sample_tracks
     from plot_tracks import plot_case
 
-    source = "ecmwf"
     print(f"Storms: {[s['storm_name'] for s in storms]} | source={source} | "
           f"cycles={cycles} | stages={list(stages)} | plot={plot}")
 
@@ -111,6 +111,7 @@ def run(storms_filter=None, init_overrides=None,
         print(f"[read] {n_read} case(s)")
 
     # ── stages 2-4 per storm (case dirs live under tracks/processed/{name}_{year}) ──
+    suffix = "_gefs" if source == "gefs" else ""
     total = 0
     for storm in storms:
         from config import storm_dir_name
@@ -120,6 +121,8 @@ def run(storms_filter=None, init_overrides=None,
             continue
         for case in sorted(sdir.glob("*/")):
             if not case.is_dir():
+                continue
+            if suffix and not case.name.endswith(suffix):
                 continue
             label = f"{storm['storm_name']}/{case.name}"
             if "pairs" in stages:
@@ -147,6 +150,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--storms", default="", help="comma-separated storm dir names")
     ap.add_argument("--all", action="store_true", help="run every discovered storm")
+    ap.add_argument("--source", default="", choices=["", "ecmwf", "gefs"],
+                    help="ecmwf: TIGGE ECMWF parents | gefs: TIGGE kwbc GEFS "
+                         "parents (same 31 members as GEFS env fields)")
     ap.add_argument("--init", default="",
                     help="per-storm init override NAME:YYYYMMDDHH[+...]")
     ap.add_argument("--n-tracks", type=int, default=N_TRACKS)
@@ -165,6 +171,7 @@ def main():
         [s for s in args.storms.split(",") if s.strip()] or None)
 
     run(storms_filter=storms_filter,
+        source=args.source or None,
         init_overrides=parse_init_overrides(args.init),
         cycles=args.cycles,
         n_tracks=args.n_tracks,

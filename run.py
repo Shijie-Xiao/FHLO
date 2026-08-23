@@ -238,7 +238,13 @@ def run_ensemble(args, cfg):
     bt = _load_best_track(bt_pkl)
     init_time, dt_hours, lons, lats, t_sec, _ = _load_synthetic(
         synth_nc, n_members, seed=0)
-    if str(init_time) != args.gefs_init:
+    import pandas as _pd
+    try:
+        init_delta = abs((_pd.Timestamp(str(init_time))
+                          - _pd.Timestamp(args.gefs_init)).total_seconds())
+    except Exception:
+        init_delta = 0
+    if init_delta > 3601:
         print(f'[ens] NOTE synth init {init_time} != GEFS init {args.gefs_init} '
               f'(env valid-time interpolation handles the offset)')
     jobs, member_dirs = [], []

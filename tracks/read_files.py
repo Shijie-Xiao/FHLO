@@ -27,6 +27,8 @@ from config import (
     discover_storms, storm_dir_name,
 )
 
+GEFS_TIGGE_BASE_DIR = ECMWF_BASE_DIR.parent / "kwbc"
+
 
 def _parse_dt(text):
     """Parse CXML time; tolerant of optional trailing 'Z' (2017 has Z)."""
@@ -147,6 +149,140 @@ def _ecmwf_xml_for_cycle(year, cycle, base_dir=None):
     return sorted(ddir.glob("*.xml"))
 
 
+def _gefs_tigge_xml_for_cycle(year, cycle):
+    """TIGGE kwbc (NCEP) GEFS ensemble-track XMLs for one cycle."""
+    ddir = GEFS_TIGGE_BASE_DIR / str(year) / cycle.strftime("%Y%m%d")
+    if not ddir.is_dir():
+        return []
+    return sorted(ddir.glob("*_GEFS_glob_prod_esttr_glo.xml"))
+
+
+def read_case_gefs_tigge(storm, cycle, min_members=None, save=True):
+    """Load one (storm, cycle) case from TIGGE kwbc GEFS XML; write raw.pkl.
+
+    Members 0-30 map to GEFS codes c00, p01..p30 — the SAME members as the
+    GEFS forecast fields, so parent_paired track/environment assignment is
+    fully self-consistent (no cross-system mixing). Pre-genesis cycles name
+    the disturbance 'Invest'; fall back to matching it against the best-track
+    genesis position (within 600 km).
+    """
+    min_members = min_members or MIN_MEMBERS
+    members = {}
+    genesis_t = storm.get("genesis")
+    genesis_pos = _genesis_position(storm)
+    for fp in _gefs_tigge_xml_for_cycle(storm["year"], cycle):
+        trks, base_time = parse_tigge_xml(fp, storm["storm_name"],
+                                          base_time_filter=cycle)
+        if base_time is None:
+            continue
+        if not trks and genesis_pos is not None:
+            trks = _parse_invest_near(fp, base_time, genesis_pos)
+        if not trks:
+            continue
+        for tr in trks:
+            mid = tr["member_id"]
+            if mid not in members or len(tr["lon"]) > len(members[mid]["lon"]):
+                members[mid] = tr
+    if len(members) < min_members:
+        return None
+    tracks = []
+    for mid in sorted(members):
+        tr = dict(members[mid])
+        tr["parent_member"] = "c00" if mid == 0 else f"p{mid:02d}"
+        tracks.append(tr)
+    return _package_case(storm, cycle, tracks, "gefs_tigge", save)
+
+
+def _genesis_position(storm):
+    """(lat, lon 0..360) of the first best-track fix, for Invest matching."""
+    import csv
+    bt_csv = Path(storm["storm_dir"]) / "track_intensity_6h.csv"
+    if not bt_csv.exists():
+        return None
+    try:
+        with open(bt_csv) as f:
+            row = next(csv.DictReader(f))
+        lat = float(row["lat"]); lon = float(row["lon"])
+        if lon < 0:
+            lon += 360
+        return (lat, lon)
+    except Exception:
+        return None
+
+
+def _parse_invest_near(fp, base_time, genesis_pos, max_km=600):
+    """Ensemble 'Invest' disturbances whose first fix is within max_km of the
+    best-track genesis point (used for pre-genesis GEFS cycles)."""
+    tracks = []
+    try:
+        root = ET.parse(fp).getroot()
+    except Exception:
+        return []
+    import math
+    for data_elem in root.findall("data"):
+        if data_elem.get("type", "") != "ensembleForecast":
+            continue
+        ms = data_elem.get("member")
+        if ms is None:
+            continue
+        member_id = int(ms)
+        if member_id < 0 or member_id > 30:
+            continue
+        for dist in data_elem.findall("disturbance"):
+            ne = dist.find("cycloneName")
+            name = ne.text.strip() if ne is not None and ne.text else ""
+            if name and name.upper() != "INVEST":
+                continue  # only unnamed invests
+            fixes = dist.findall("fix")
+            if not fixes:
+                continue
+            try:
+                lat_v = float(fixes[0].find("latitude").text.rstrip("NSns"))
+                lon_txt = fixes[0].find("longitude").text.strip()
+                lon_units = (fixes[0].find("longitude").get("units") or "").upper()
+                west = lon_txt.upper().endswith("W") or "W" in lon_units
+                lon_v = float(lon_txt.rstrip("EWew"))
+                if west and lon_v > 0:
+                    lon_v = -lon_v
+            except Exception:
+                continue
+            # great-circle distance to genesis
+            glat, glon = genesis_pos
+            dlat = math.radians(lat_v - glat)
+            dlon = math.radians(((lon_v % 360) - glon))
+            a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(glat)) \
+                * math.cos(math.radians(lat_v)) * math.sin(dlon / 2) ** 2
+            if 6371 * 2 * math.asin(math.sqrt(a)) > max_km:
+                continue
+            lon_list, lat_list, time_list = [], [], []
+            for fix in fixes:
+                try:
+                    la = float(fix.find("latitude").text.rstrip("NSns"))
+                    lt = fix.find("longitude").text.strip()
+                    lu = (fix.find("longitude").get("units") or "").upper()
+                    w = lt.upper().endswith("W") or "W" in lu
+                    lo = float(lt.rstrip("EWew"))
+                    if w and lo > 0:
+                        lo = -lo
+                    te = fix.find("validTime")
+                    ft = _parse_dt(te.text) if te is not None and te.text else base_time
+                    if ft:
+                        lon_list.append(((lo + 180) % 360) - 180)
+                        lat_list.append(la)
+                        time_list.append(ft)
+                except Exception:
+                    continue
+            if len(lon_list) >= 2:
+                tracks.append({
+                    "ensemble_system": "gefs_tigge", "member_id": member_id,
+                    "storm_name": "Invest", "basin": None,
+                    "init_time": base_time,
+                    "lon": np.array(lon_list), "lat": np.array(lat_list),
+                    "datetime": time_list,
+                })
+    return tracks
+
+
 def read_case_ecmwf(storm, cycle, min_members=None, save=True):
     """Load one (storm, cycle) case from TIGGE XML; write raw.pkl."""
     min_members = min_members or MIN_MEMBERS
@@ -184,21 +320,25 @@ def _package_case(storm, cycle, tracks, source, save=True):
         "ensemble_systems": [source],
     }
     if save:
-        out_dir = case_dir(storm["storm_name"], storm["year"], cycle)
+        out_dir = case_dir(storm["storm_name"], storm["year"], cycle, source)
         out_dir.mkdir(parents=True, exist_ok=True)
         with open(out_dir / "raw.pkl", "wb") as f:
             pickle.dump(result, f)
     return result
 
 
-def case_dir(storm_name: str, year, cycle: datetime) -> Path:
-    """tracks/processed/{name}_{year}/{YYYYMMDDHH}"""
-    return PROCESSED_TRACKS_DIR / storm_dir_name(storm_name, year) \
-        / cycle.strftime("%Y%m%d%H")
+def case_dir(storm_name: str, year, cycle: datetime, source: str = "ecmwf") -> Path:
+    """tracks/processed/{name}_{year}/{YYYYMMDDHH} (GEFS source suffixes _gefs)."""
+    sub = cycle.strftime("%Y%m%d%H")
+    if source.startswith("gefs"):
+        sub += "_gefs"
+    return PROCESSED_TRACKS_DIR / storm_dir_name(storm_name, year) / sub
 
 
 def read_case(storm, cycle, source="ecmwf", **kw):
-    """Read one (storm, cycle) case from the parent ensemble (ECMWF TIGGE)."""
+    """Read one (storm, cycle) case from the parent ensemble (TIGGE XML)."""
+    if source == "gefs":
+        return read_case_gefs_tigge(storm, cycle, **kw)
     return read_case_ecmwf(storm, cycle, **kw)
 
 
@@ -226,7 +366,9 @@ def run_read_cases(storms=None, source="ecmwf", init_times=None):
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
+    ap.add_argument("--source", default="ecmwf", choices=["ecmwf", "gefs"],
+                    help="ecmwf: TIGGE ECMWF XML | gefs: TIGGE kwbc GEFS XML")
     ap.add_argument("--storms", default="", help="comma-separated storm dir names")
     args = ap.parse_args()
     flt = [s for s in args.storms.split(",") if s.strip()] or None
-    run_read_cases(discover_storms(storms_filter=flt), source="ecmwf")
+    run_read_cases(discover_storms(storms_filter=flt), source=args.source)

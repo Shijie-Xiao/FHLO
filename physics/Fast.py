@@ -14,8 +14,8 @@ from utils import (compute_vent, compute_dm_dt, compute_dv_dt,
                    compute_alpha, compute_beta, compute_gamma)
 from constants import Earth_Radius, Epsilon, Kappa
 
-from track import Track, RandomTrack
-from env import BaseEnvProvider, ConstantEnvProvider
+from track import Track
+from env import BaseEnvProvider
 
 class Fast:
     """
@@ -26,8 +26,10 @@ class Fast:
         Initialize FAST model
 
         Args:
-            env_provider: Environment data provider (e.g., ConstantEnvProvider)
-            track_provider: Track velocity provider (e.g., RandomTrack)
+            env_provider: Environment data provider (implementations of
+                BaseEnvProvider, e.g. PrecomputedEnv in the ensemble pipeline)
+            track_provider: Track velocity provider (implementations of the
+                Track protocol, e.g. BTTrack in the ensemble pipeline)
             h_bl: Boundary layer depth in meters. Default 1400 m for the NA
                 basin, matching Lin et al. namelist atm_bl_depth['NA'] and
                 Ck = 1.2e-3 (the Ck/h pair must be changed together).

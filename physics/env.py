@@ -36,42 +36,6 @@ class BaseEnvProvider:
         get the environment at time t, lon, lat
         """
         raise NotImplementedError("Subclasses must implement this method")
-    
-class ConstantEnvProvider(BaseEnvProvider):
-    """
-    constant env provider class
-    """
-    v_pot: float
-    h_m: float
-    t_strat: float
-    chi: float
-    C_k: float
-    env_wind_profile: Sequence[float]
-    bathymetry: float
-
-    def __init__(self, v_pot: float = 80.0, h_m: float = 50.0, t_strat: float = 0.2, chi: float = 0.5, C_k: float = 1.2e-3, env_wind_profile: Sequence[float] = (5.0, 0.0, 0.0, 0.0), bathymetry: float = -5000.0):
-        self.v_pot = float(v_pot)
-        self.h_m = float(h_m)
-        self.t_strat = float(t_strat)
-        self.chi = float(chi)
-        self.C_k = float(C_k)
-        self.env_wind_profile = env_wind_profile
-        self.bathymetry = float(bathymetry)
-    def get_env(self, t: float, lon: float, lat: float) -> Dict[str, Any]:
-        """
-        get the environment at time t, lon, lat
-        """
-        return {
-            "v_pot": float(self.v_pot),
-            "h_m": float(self.h_m),
-            "t_strat": float(self.t_strat),
-            "chi": float(self.chi),
-            "C_k": float(self.C_k),
-            "env_wind_profile": self.env_wind_profile,
-            "bathymetry": float(self.bathymetry),
-            "rh_mid": None,
-            "is_land": self.bathymetry >= 0.0
-        }
 
 
 class ERA5EnvProvider(BaseEnvProvider):
