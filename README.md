@@ -31,8 +31,7 @@ FHLO/
 │   └── prepare_ensemble_storm.py        #   synthetic-track NC loaders + member splice
 ├── physics/                             # FAST model
 │   ├── run_fast_reference.py            #   single-track ODE (48h init + F decay)
-│   ├── run_fast_physics_torch.py        #   batched/GPU version
-│   ├── Fast.py / env.py / track.py      #   ODE core, env providers, track providers
+│   ├── Fast.py / env.py / track.py      #   ODE core, env providers, track protocol
 │   └── constants.py / utils.py
 ├── tracks/                              # synthetic-track module (see tracks/README.md)
 │   ├── batch_generate.py                #   THE entry: read->pairs->fit->sample->plot
@@ -123,7 +122,8 @@ Beryl (313 steps) ≈ 8 min single-process.
 | `gefs_root` | GEFS GRIB2 archive (tracks, adapter, ens prep) | CFS path |
 | `ecmwf_root` | TIGGE ECMWF XML archive (tracks) | CFS path |
 | `gefs_cache_dir` | GEFS cfgrib→NetCDF cache (optional) | `data/gefs_nc_cache` |
-| `gefs_case_dir` | specific GEFS case for `run_prep_gefs_ens1000.py` (optional) | `{gefs_root}/2025_ERIN_NA` |
+| `gefs_beryl_dir` | local GEFS nc dir for `run.py --ensemble` | `data/gefs_beryl` |
+| `gefs_init` | GEFS forecast init time for `run.py --ensemble` | `2024-06-28 12:00` |
 
 `{STORM}_dataset.pkl` keys:
 
@@ -201,10 +201,20 @@ Details and paper-conformance table: `tracks/README.md`.
 ## Pipeline 3 — Full 1000-member ensemble forecast (`run.py --ensemble`)
 
 One command drives the whole chain: synthetic tracks (Pipeline 2) are spliced
-hourly with the best-track intensity, each track is assigned a GEFS ensemble
-member's forecast environment, prep extracts per-member scalars with strict
-vortex surgery, and the FAST ODE produces per-member V(t) — all in a process
-pool.
+hourly with the best-track intensity, each track is assigned an environment
+(GEFS member forecast or ERA5 analysis), prep extracts per-member scalars with
+strict vortex surgery, and the FAST ODE produces per-member V(t) — all in a
+process pool (member-batched for cache locality, BLAS threads pinned).
+
+Two environment backends, both one command:
+
+- **`--env gefs`** (forecast mode): self-consistent GEFS everywhere — tracks
+  sampled from TIGGE kwbc GEFS parents (31 members c00/p01–p30, including
+  pre-genesis 'Invest' cycles), environment from the same members' forecast
+  fields, `--assign gefs` pairs each track with its parent member directly.
+- **`--env era5`** (analysis mode): tracks sampled from ECMWF TIGGE parents
+  (51 members e00–e50) with environment from the local ERA5 analysis crop
+  (`data/era5`); `--assign ecmwf` default. No GEFS involved.
 
 ```
 synthetic_tracks_1000members.nc ──┐
@@ -214,12 +224,15 @@ synthetic_tracks_1000members.nc ──┐
                                    ▼
         run.py --ensemble (stage eprep)
           resolve_member_assignment():
-            ecmwf       parent_track[i] % 31  (51 ECMWF parents -> 31 GEFS members)
             gefs        parent GEFS code directly (self-consistent)
+            ecmwf       parent_track[i] % 31  (51 ECMWF parents -> 31 GEFS members)
             round_robin i % 31
-          ensemble/gefs_nc_adapter.py (pgrb2a+b level merge, MSL + skt SST,
-            native 0.5-deg grid, fhour cache, vortex surgery incl. edge
-            degradation)  ->  {OUT}/{STORM}_M{NNN}/{STORM}_M{NNN}_dataset.pkl
+          env source:
+            gefs -> ensemble/gefs_nc_adapter.py (pgrb2a+b level merge, MSL +
+                   skt SST, native 0.5-deg, fhour cache, surgery edge
+                   degradation)
+            era5 -> local data/era5 analysis files directly
+                               ->  {OUT}/{STORM}_M{NNN}/{STORM}_M{NNN}_dataset.pkl
                                    │
         run.py --ensemble (stage ode)
           physics/run_fast_reference.py per member
@@ -227,26 +240,33 @@ synthetic_tracks_1000members.nc ──┐
 ```
 
 ```bash
-# quick test: 5 members
-python run.py --ensemble \
-    --synth-nc tracks/processed/beryl_2024/2024062900/synthetic_tracks_1000members.nc \
-    --members 5 --assign ecmwf --workers 5
+# forecast mode: GEFS tracks x GEFS env (self-consistent), full 1000 members
+python run.py --ensemble --env gefs \
+    --synth-nc tracks/processed/beryl_2024/2024062812_gefs/synthetic_tracks_1000members.nc \
+    --members 1000 --workers 64
 
-# full 1000-member run (slurm: run.slurm passes args through)
-python run.py --ensemble \
+# analysis mode: ECMWF tracks x ERA5 env, full 1000 members
+python run.py --ensemble --env era5 \
     --synth-nc tracks/processed/beryl_2024/2024062900/synthetic_tracks_1000members.nc \
-    --members 1000 --assign ecmwf --workers 32
+    --members 1000 --workers 64
+
+# quick test: 5 members
+python run.py --ensemble --env gefs \
+    --synth-nc tracks/processed/beryl_2024/2024062812_gefs/synthetic_tracks_1000members.nc \
+    --members 5 --workers 5
 
 # key flags
 #   --assign ecmwf|gefs|round_robin   env-member assignment mode
+#   --env gefs|era5                    environment backend (see above)
+#   --assign gefs|ecmwf|round_robin   env-member assignment (default follows --env)
 #   --gefs-init / --gefs-dir          GEFS forecast init / local nc dir
-#                                     (defaults from config.txt)
+#                                     (defaults from config.txt; --env gefs only)
 #   --members N                       subset for testing
 #   --duration-h H                    per-member forecast length (default 240)
-#   --out-root DIR                    default data/ensemble/beryl_gefs_1000
+#   --out-root DIR                    default data/ensemble/beryl_{env}_1000
 ```
 
-Output layout: `data/ensemble/beryl_gefs_1000/{STORM}_M{NNN}/` with
+Output layout: `data/ensemble/beryl_{gefs|era5}_1000/{STORM}_M{NNN}/` with
 `_track.csv`, `member_assignment.txt`, `_dataset.pkl`, `fast_reference.csv`,
 `fast_reference.png`; the run finishes with an ensemble peak-intensity
 summary (mean/median/min/max/sd across members).
@@ -258,9 +278,9 @@ summary (mean/median/min/max/sd across members).
 | use | source | local dir |
 |---|---|---|
 | SST (deterministic) | ERA5 SSTK / OISST (GHRSST) | `data/era5`, `data/oisst` |
-| SST (ensemble) | GEFS skt skin temperature | `data/gefs_beryl/skt_*.nc` |
+| SST (ensemble, gefs mode) | GEFS skt skin temperature | `data/gefs_beryl/skt_*.nc` |
 | env fields (T/Q/U/V/Z/MSL) | ERA5 analysis / GEFS forecast | `data/era5`, `data/gefs_beryl` |
-| parent ensemble tracks | ECMWF TIGGE XML | CFS `ecmwf_root` |
+| parent ensemble tracks | ECMWF TIGGE XML / NCEP GEFS TIGGE XML | CFS `ecmwf_root` / CFS `ecmwf_root/../kwbc` |
 | best track | IBTrACS | `data/ibtracs` |
 
 Local ERA5/OISST crops are **time-cropped, full spatial domain** (NA archive
