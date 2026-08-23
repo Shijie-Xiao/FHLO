@@ -836,9 +836,11 @@ def process_one_storm(track_csv, era5_root_override=None, sst_source='ERA5',
             sfc_curr = _open_sfc(t_curr, sfc_cache, era5_cfg)
             if sst_source.upper() == 'OISST':
                 sst_raw = _sst_oisst_at(t_lag, qlat, qlon, oisst_cache, oisst_dir)
-                sst_k = sst_raw  # already Kelvin, NaN propagates
-                if np.isnan(sst_k):
-                    raise _Abort("OISST missing")
+                # Land / outside OISST grid -> cold fallback (273.15 K), same
+                # convention as the ERA5 branch (np.isnan(sst_raw) -> K_TO_C):
+                # keep the step with a hostile SST so the time axis stays
+                # aligned; vp->0 over land then handles decay.
+                sst_k = K_TO_C if np.isnan(sst_raw) else float(sst_raw)
             else:
                 if not sfc_lag or not sfc_lag.get('ds'):
                     raise _Abort("SST missing")

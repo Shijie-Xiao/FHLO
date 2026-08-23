@@ -14,7 +14,7 @@ clear_first = false
 storms = 2024181N09320_BERYL
 
 # ---- SST data source: ERA5 | OISST ----
-sst_source = ERA5
+sst_source = OISST
 
 # ---- Environment fields source: ERA5 | GEFS ----
 env_source = ERA5
