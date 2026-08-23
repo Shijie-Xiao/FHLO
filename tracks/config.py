@@ -114,14 +114,19 @@ def _bt_from_dir(storm_dir: Path):
     return rows or None
 
 
-def discover_storms(storms_filter=None, years=None, basins=("NA",)):
+def discover_storms(storms_filter=None, years=None, basins=None):
     """All named storms with best-track data.
 
     storms_filter: list of storm dir names (e.g. ['2024181N09320_BERYL']);
                    None = every discovered storm.
+    basins: iterable of basin codes; None = every basin directory present
+            (storm dir names are globally unique so a full scan is safe).
     Returns [{storm_name, ibtracs_id, storm_dir, year, basin,
               genesis, last_time}]
     """
+    if basins is None:
+        basins = sorted(d.name for d in BEST_TRACK_DIR.iterdir()
+                        if d.is_dir() and not d.name.startswith('_'))
     want = set(storms_filter) if storms_filter else None
     out = []
     for basin in basins:

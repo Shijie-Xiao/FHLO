@@ -27,6 +27,9 @@ logs/
 *.log
 download/*.log
 
+# ---- Download scripts (one-off crop/download utilities; not part of the model) ----
+download/
+
 # ---- Editor / OS ----
 .vscode/
 .idea/
