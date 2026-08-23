@@ -3,3 +3,7 @@ __pycache__/
 *.egg-info/
 .DS_Store
 .ipynb_checkpoints/
+
+# Data & download scripts (not synced)
+data/
+download/
