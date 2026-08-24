@@ -431,20 +431,28 @@ def run_ensemble(args, cfg):
         _save_ensemble_nc(out_root, sd.name, results, env, args.assign,
                           args.gefs_init)
         _summarize_ensemble(out_root, sd.name)
-        _plot_ensemble(out_root, sd.name)
+        _plot_ensemble(out_root, sd.name, cfg)
 
     if 'plot' in stages and 'ode' not in stages:
         # plot-only invocation (e.g. --stage plot) reads the saved NC
-        _plot_ensemble(out_root, sd.name)
+        _plot_ensemble(out_root, sd.name, cfg)
 
 
-def _plot_ensemble(out_root, storm_name):
-    """Render ensemble_fast.png/svg from ensemble_fast.nc (FAST-only)."""
+def _plot_ensemble(out_root, storm_name, cfg=None):
+    """Render ensemble_fast.png/svg from ensemble_fast.nc (FAST-only).
+
+    Google FNV3 overlay keys come from config.txt when present:
+      google_csv_{tag} / google_id_{tag}  (see ensemble/download_fnv3.py)."""
     out_root = Path(out_root)
     nc = out_root / 'ensemble_fast.nc'
     if not nc.exists():
         print(f'[ens plot] missing {nc}, skip')
         return
+    tag = storm_name.split('_', 1)[-1].lower() if '_' in storm_name else ''
+    g_csv = g_id = ''
+    if cfg:
+        g_csv = cfg.get(f'google_csv_{tag}', '')
+        g_id = cfg.get(f'google_id_{tag}', '')
     try:
         import subprocess
         cmd = [sys.executable,
@@ -453,6 +461,13 @@ def _plot_ensemble(out_root, storm_name):
                '--out_png', str(out_root / 'ensemble_fast.png'),
                '--storm', storm_name.split('_')[-1] if '_' in storm_name
                else storm_name]
+        if g_csv and (PROJECT_ROOT / g_csv).exists():
+            cmd += ['--google_csv', str(PROJECT_ROOT / g_csv)]
+            if g_id:
+                cmd += ['--google_id', g_id]
+        elif g_csv:
+            print(f'[ens plot] NOTE google_csv_{tag}={g_csv} not found '
+                  f'(fetch: python ensemble/download_fnv3.py)')
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         for ln in (r.stdout or '').strip().splitlines():
             print(f'  {ln}')

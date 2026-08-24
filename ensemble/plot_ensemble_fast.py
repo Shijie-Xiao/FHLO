@@ -71,8 +71,8 @@ def main():
     obs0 = obs[0]
     Tobs = int(np.isfinite(obs0).sum())
 
-    # Google overlay (optional)
-    g_lead = g_mean = g_topm = None
+    # Google overlay (optional; CSV from ensemble/download_fnv3.py)
+    g_lead = g_mean = g_topm = g_p10 = g_p90 = g_mat = None
     nG = 0
     if args.google_csv and Path(args.google_csv).exists():
         g = pd.read_csv(args.google_csv, comment="#")
@@ -91,6 +91,8 @@ def main():
             g_mat[i] = np.interp(g_lead, ser.index.values, ser.values,
                                  left=np.nan, right=np.nan)
         g_mean = np.nanmean(g_mat, 0)
+        g_p10 = np.nanpercentile(g_mat, 10, 0)
+        g_p90 = np.nanpercentile(g_mat, 90, 0)
         gt = np.argsort(np.nanmax(g_mat, 1))[-max(1, int(nG * 0.10)):]
         g_topm = np.nanmean(g_mat[gt], 0)
 
@@ -110,6 +112,12 @@ def main():
         fig, ax = plt.subplots(figsize=(11, 6), dpi=180)
 
     # ---- top: intensity ----
+    if g_mat is not None:
+        ax.fill_between(g_lead, g_p10, g_p90, color="#dc2626", alpha=0.10,
+                        zorder=1)
+        for i in range(nG):
+            ax.plot(g_lead, g_mat[i], color="#fecaca", lw=0.3, alpha=0.28,
+                    zorder=1)
     for i in range(fast.shape[0]):
         ax.plot(h, fast[i], color="#86efac", lw=0.2, alpha=0.18, zorder=2)
     ax.plot(h, obs0, "k-", lw=3.0, zorder=9,
@@ -124,6 +132,8 @@ def main():
         ax.plot(g_lead, g_topm, color="#dc2626", lw=1.8, ls="--", marker="s",
                 ms=3.5, mfc="none", zorder=8,
                 label=f"Google FNV3 top10% (peak {np.nanmax(g_topm):.0f})")
+        ax.plot(g_lead, g_p90, color="#dc2626", lw=1.2, ls=":",
+                zorder=7, label="Google FNV3 p90")
     xmax = args.max_hours if args.max_hours is not None else \
         max(Tobs, float(g_lead.max()) if g_lead is not None else 0)
     ax.set_xlim(0, xmax)
@@ -132,8 +142,9 @@ def main():
     ax.set_ylabel("Intensity (kt)")
     sname = (args.storm or "").strip().upper()
     envlab = {"gefs": "GEFS fcst env", "era5": "ERA5 analysis env"}.get(env, env)
+    gtxt = " vs Google FNV3" if g_mean is not None else ""
     ax.set_title((f"{sname}: " if sname else "")
-                 + f"FAST ensemble ({nmem} members, {envlab}) vs IBTrACS",
+                 + f"FAST ensemble ({nmem} members, {envlab}){gtxt} vs IBTrACS",
                  fontweight="bold")
     ax.legend(loc="upper right", fontsize=9, ncol=2, framealpha=0.9)
 
@@ -164,6 +175,11 @@ def main():
           f"p50={np.nanpercentile(peaks,50):.0f} "
           f"p90={np.nanpercentile(peaks,90):.0f} | "
           f"obs={np.nanmax(obs0[:Tobs]):.0f}")
+    if g_mat is not None:
+        gpk = np.nanmax(g_mat, axis=1)
+        print(f"  Google FNV3 ({nG} mem) mean peak={np.nanmean(gpk):.1f} "
+              f"med={np.nanmedian(gpk):.1f} p10={np.nanpercentile(gpk,10):.0f} "
+              f"p90={np.nanpercentile(gpk,90):.0f} max={np.nanmax(gpk):.0f}")
 
 
 if __name__ == "__main__":
