@@ -139,6 +139,10 @@ def parse_basins(s):
 
 
 # ---------- Basin / ERA5 config ----------
+# Official namelist atm_bl_depth per basin (m) -- the ONLY h_bl standard.
+_ATM_BL_DEPTH = {'NA': 1400.0, 'EP': 1400.0, 'WP': 1800.0, 'AU': 1800.0,
+                 'SI': 1600.0, 'SP': 2000.0, 'NI': 1500.0}
+
 def infer_basin(track_csv_path=None, hurricane_name=None):
     path_s = str(track_csv_path or '').upper()
     name_s = str(hurricane_name or '').upper()
@@ -914,16 +918,23 @@ def process_one_storm(track_csv, era5_root_override=None, sst_source='ERA5',
     ds_bathy = xr.open_dataset(PRECALC_DIR / 'bathymetry.nc') if (PRECALC_DIR / 'bathymetry.nc').exists() else None
     ds_land = xr.open_dataset(PRECALC_DIR / 'land.nc') if (PRECALC_DIR / 'land.nc').exists() else None
 
-    # Load Cd interpolator from precalc (same as ODE geo.read_drag)
+    # Load Cd interpolator from precalc and apply the OFFICIAL geo.read_drag
+    # three-step chain (Lin et al. / tropical_cyclone_risk):
+    #   Cd_gradient = Cd/(1+250*Cd)     10-m -> gradient-wind height
+    #   Cd_norm     = Cd_gradient/min   pure ocean normalized to 1.0
+    #   Cd_final    = 1.2e-3 * Cd_norm  ocean floor == namelist Cd
     from scipy.interpolate import RectBivariateSpline
     _f_Cd = None
     _Cd_const = 1.2e-3
+    _RAW_CD_OCEAN_MIN = 7.113969e-4
+    _GRAD_OCEAN_MIN = _RAW_CD_OCEAN_MIN / (1.0 + 250.0 * _RAW_CD_OCEAN_MIN)
     if (PRECALC_DIR / 'Cd.nc').exists():
         ds_cd = xr.open_dataset(PRECALC_DIR / 'Cd.nc')
         cd_lat = ds_cd['latitude'].values
         cd_lon = ds_cd['longitude'].values
         cd_vals = ds_cd['Cd'].values
-        _f_Cd = RectBivariateSpline(cd_lon, cd_lat, cd_vals.T)
+        # kx=ky=1 -> bilinear, matching official interp2d(kind='linear')
+        _f_Cd = RectBivariateSpline(cd_lon, cd_lat, cd_vals.T, kx=1, ky=1)
         ds_cd.close()
 
     def _get_cd_at(lon, lat):
@@ -933,9 +944,13 @@ def process_one_storm(track_csv, era5_root_override=None, sst_source='ERA5',
         lat = float(lat) if np.isfinite(lat) else 0.0
         lon = lon + 360 if lon < 0 else lon
         try:
-            return float(_f_Cd.ev(lon, lat).flatten()[0])
+            raw = float(_f_Cd.ev(lon, lat).flatten()[0])
         except Exception:
             return _Cd_const
+        grad = raw / (1.0 + 250.0 * raw)
+        if grad <= _GRAD_OCEAN_MIN:
+            return _Cd_const
+        return _Cd_const * grad / _GRAD_OCEAN_MIN
 
     out = {k: [] for k in ['spatial_3d', 'spatial_2d', 'scalars', 'chi_ref', 's_ref', 'xs_ref',
                             'v_init', 'v_gt', 'times', 'lats', 'lons', 'env_wnds', 'utran', 'vtran',
@@ -1105,7 +1120,9 @@ def process_one_storm(track_csv, era5_root_override=None, sst_source='ERA5',
                     blh_v = next((v for v in blh_ds.data_vars if 'blh' in v.lower()), None)
                     if blh_v:
                         blh_val = _sel_point(blh_ds[blh_v], qlat, qlon)
-            out['blh_ref'].append(float(blh_val) if np.isfinite(blh_val) else 1400.0)
+            # official atm_bl_depth per basin is the fallback/standard
+            out['blh_ref'].append(float(blh_val) if np.isfinite(blh_val) and float(blh_val) > 50
+                                  else _ATM_BL_DEPTH.get(basin, 1400.0))
             out['v_gt'].append(v_ms)
             out['times'].append(t_curr)
             out['lats'].append(qlat); out['lons'].append(qlon_n)

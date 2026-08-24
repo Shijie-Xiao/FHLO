@@ -118,11 +118,11 @@ def _ode_one(job):
     """Stage 3 worker: one pkl -> fast_reference csv/png. Returns (storm, ok, msg)."""
     sys.path.insert(0, str(PROJECT_ROOT / 'physics'))
     import run_fast_reference as fast
-    basin, year, storm_dir = job
+    basin, year, storm_dir, ode_mode = job
     pkl = storm_dir / f'{storm_dir.name}_dataset.pkl'
     try:
-        r = fast.process_one_pkl(pkl)
-        return storm_dir.name, True, f"MAE={r['mae_kts']:.1f} kts"
+        r = fast.process_one_pkl(pkl, ode_mode=ode_mode)
+        return storm_dir.name, True, f"[{ode_mode}] MAE={r['mae_kts']:.1f} kts"
     except Exception as e:
         return storm_dir.name, False, f'{type(e).__name__}: {e}'
 
@@ -266,7 +266,7 @@ def _ens_ode_one(job):
     Returns (mi, ok, msg, result) where result carries the member's V(t)
     series (v_fast/v_max/vp/v_obz/m, kts) for the ensemble NC.
     """
-    mi, out_dir = job
+    mi, out_dir, ode_mode = job
     sys.path.insert(0, str(PROJECT_ROOT / 'physics'))
     import run_fast_reference as fast
     out_dir = Path(out_dir)
@@ -274,7 +274,7 @@ def _ens_ode_one(job):
     try:
         import numpy as np
         import pandas as pd
-        r = fast.process_one_pkl(pkl, save_csv=True, save_plot=False)
+        r = fast.process_one_pkl(pkl, save_csv=True, save_plot=False, ode_mode=ode_mode)
         csv = out_dir / 'fast_reference.csv'
         if csv.exists():
             df = pd.read_csv(csv)
@@ -334,7 +334,7 @@ def run_ensemble(args, cfg):
         f.write(f'storm={sd.name}\nenv={env}\nvortex_mode={vortex_mode}\n'
                 f'members={n_members}\nassign={args.assign}\n'
                 f'synth_nc={synth_nc}\ngefs_init={args.gefs_init}\n'
-                f'duration_h={args.duration_h}\n'
+                f'duration_h={args.duration_h}\node_mode={args.ode_mode}\n'
                 f'gefs_dir={args.gefs_dir if env == "gefs" else ""}\n')
 
     # ---- stage eprep: build per-member track CSV then env dataset ----
@@ -408,7 +408,7 @@ def run_ensemble(args, cfg):
               f'({time.time() - t0:.0f}s)')
 
     if 'ode' in stages:
-        ode_jobs = [(i, d) for i, d in enumerate(member_dirs)
+        ode_jobs = [(i, d, args.ode_mode) for i, d in enumerate(member_dirs)
                     if (d / f'{d.name}_dataset.pkl').exists()]
         print(f'[ens ode] {len(ode_jobs)} FAST ODE runs, workers={args.workers}')
         n_ok = 0
@@ -704,6 +704,11 @@ def main():
                          'mean, ODE training convention, default) or surgery '
                          '(strict Lin et al. vortex surgery on full-global '
                          'fields; any failure rejects the member)')
+    ap.add_argument('--ode-mode', default='fhlo',
+                    choices=['fhlo', 'free', 'cold'],
+                    help='FAST ODE mode: fhlo = 48h obs replay + F forcing '
+                         '(default, FHLO standard); free = replay without F; '
+                         'cold = no replay, cold start from first obs')
     args = ap.parse_args()
 
     cfg = load_cfg(args.config)
