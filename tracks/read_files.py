@@ -41,13 +41,18 @@ def _parse_dt(text):
         return None
 
 
-def parse_tigge_xml(fp: Path, storm_name: str, base_time_filter: datetime = None):
+def parse_tigge_xml(fp: Path, storm_name: str, base_time_filter: datetime = None,
+                    genesis_pos=None, max_km=600.0):
     """Parse one TIGGE XML; return ensemble-member tracks of the named storm.
 
     Longitude/latitude conventions differ between TIGGE generations:
       2023+ : units='N'/'W' with SIGNED values
       2017-22: units='deg N'/'deg W' with unsigned magnitudes
     Hemisphere indicated by units OR a trailing letter forces the sign.
+
+    Some archives (ECMWF 2025+) drop the <cycloneName> element entirely;
+    then genesis_pos=(lat, lon0_360) from the best track selects the
+    disturbance whose first fix is within max_km of the storm's genesis.
     """
     tracks = []
     try:
@@ -74,7 +79,16 @@ def parse_tigge_xml(fp: Path, storm_name: str, base_time_filter: datetime = None
             for dist in data_elem.findall("disturbance"):
                 ne = dist.find("cycloneName")
                 cyclone_name = ne.text.strip() if ne is not None and ne.text else None
-                if not cyclone_name or storm_name.upper() not in cyclone_name.upper():
+                if cyclone_name and storm_name.upper() in cyclone_name.upper():
+                    pass  # named match
+                elif genesis_pos is not None and (
+                        not cyclone_name or _is_prename(cyclone_name)):
+                    # unnamed or pre-name ('Invest', 'Two', ...) archive:
+                    # match by proximity to best-track genesis
+                    fixes0 = dist.find("fix")
+                    if fixes0 is None or not _fix_near(fixes0, genesis_pos, max_km):
+                        continue
+                else:
                     continue
                 num_e = dist.find("cycloneNumber")
                 cyclone_num = None
@@ -172,7 +186,8 @@ def read_case_gefs_tigge(storm, cycle, min_members=None, save=True):
     genesis_pos = _genesis_position(storm)
     for fp in _gefs_tigge_xml_for_cycle(storm["year"], cycle):
         trks, base_time = parse_tigge_xml(fp, storm["storm_name"],
-                                          base_time_filter=cycle)
+                                          base_time_filter=cycle,
+                                          genesis_pos=genesis_pos)
         if base_time is None:
             continue
         if not trks and genesis_pos is not None:
@@ -191,6 +206,57 @@ def read_case_gefs_tigge(storm, cycle, min_members=None, save=True):
         tr["parent_member"] = "c00" if mid == 0 else f"p{mid:02d}"
         tracks.append(tr)
     return _package_case(storm, cycle, tracks, "gefs_tigge", save)
+
+
+_PRENAMES = {"invest", "two", "three", "four", "five", "six", "seven", "eight",
+             "nine", "ten", "one", "one-e", "two-e", "three-e", "four-e",
+             "five-e", "six-e", "seven-e", "eight-e", "nine-e", "ten-e"}
+
+
+def _is_prename(name):
+    """True for placeholder cyclone names (Invest, numbering words) that
+    precede naming — these can match any storm via genesis proximity."""
+    n = name.strip().lower().rstrip(".")
+    return n in _PRENAMES or n.replace(" ", "-") in _PRENAMES
+
+
+def _fix_latlon(fix):
+    """(lat, lon in -180..180) from one <fix>, applying units/sign rules."""
+    try:
+        lat_e = fix.find("latitude")
+        lon_e = fix.find("longitude")
+        if lat_e is None or lon_e is None:
+            return None
+        lat_txt = lat_e.text.strip()
+        lat_units = (lat_e.get("units") or "").upper()
+        south = lat_txt.upper().endswith("S") or "S" in lat_units
+        lat_v = float(lat_txt.rstrip("NSns"))
+        if south and lat_v > 0:
+            lat_v = -lat_v
+        lon_txt = lon_e.text.strip()
+        lon_units = (lon_e.get("units") or "").upper()
+        west = lon_txt.upper().endswith("W") or "W" in lon_units
+        lon_v = float(lon_txt.rstrip("EWew"))
+        if west and lon_v > 0:
+            lon_v = -lon_v
+        return (lat_v, ((lon_v + 180) % 360) - 180)
+    except Exception:
+        return None
+
+
+def _fix_near(fix, genesis_pos, max_km):
+    """True when the fix lies within max_km of genesis_pos=(lat, lon 0..360)."""
+    ll = _fix_latlon(fix)
+    if ll is None:
+        return False
+    import math
+    lat_v, lon_v = ll
+    glat, glon = genesis_pos
+    dlat = math.radians(lat_v - glat)
+    dlon = math.radians(((lon_v % 360) - glon))
+    a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(glat)) \
+        * math.cos(math.radians(lat_v)) * math.sin(dlon / 2) ** 2
+    return 6371 * 2 * math.asin(math.sqrt(a)) <= max_km
 
 
 def _genesis_position(storm):
@@ -287,9 +353,11 @@ def read_case_ecmwf(storm, cycle, min_members=None, save=True):
     """Load one (storm, cycle) case from TIGGE XML; write raw.pkl."""
     min_members = min_members or MIN_MEMBERS
     members = {}
+    genesis_pos = _genesis_position(storm)
     for fp in _ecmwf_xml_for_cycle(storm["year"], cycle):
         trks, base_time = parse_tigge_xml(fp, storm["storm_name"],
-                                          base_time_filter=cycle)
+                                          base_time_filter=cycle,
+                                          genesis_pos=genesis_pos)
         if base_time is None or not trks:
             continue
         for tr in trks:

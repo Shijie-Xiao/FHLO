@@ -11,12 +11,18 @@ output_dir = data/ibtracs
 ibtracs_version = v04r01
 clear_first = false
 
-# ---- Which storms to run (blank = all discovered in output_dir) ----
+# ---- Storms to run (blank = all discovered in output_dir) ----
 # Comma-separated storm dir names, e.g. 2024181N09320_BERYL
-storms = 2024181N09320_BERYL
+# 2025 demo: Flossie (EP basin) with both track sources
+storms = 2025180N13261_FLOSSIE
+basins = NA,EP
+year_start = 2025
+year_end = 2025
 
 # ---- SST data source: ERA5 | OISST ----
-sst_source = OISST
+# ERA5 = SSTK from the local era5 crop (works for any shipped case);
+# OISST requires data/oisst dailies for the storm's year.
+sst_source = ERA5
 
 # ---- Environment fields source: ERA5 | GEFS ----
 env_source = ERA5
@@ -28,10 +34,22 @@ era5_dir = data/era5
 oisst_dir = data/oisst
 
 # ---- GEFS ensemble forecast (run.py --ensemble) ----
-# gefs_beryl_dir : local GEFS forecast nc (pgrb2a/pgrb2b/skt per member)
-# gefs_init      : GEFS forecast init time
-# synth_gefs_nc  : synthetic tracks NC sampled from GEFS TIGGE parents
-# synth_ecmwf_nc : synthetic tracks NC sampled from ECMWF TIGGE parents
+# Per-storm keys use the lowercase storm name tag (from
+# {id}_{NAME} -> tag), e.g. flossie / beryl.
+#   gefs_dir_{tag}   : local GEFS nc dir (pgrb2a/pgrb2b/skt per member)
+#   gefs_init_{tag}  : GEFS forecast init time
+#   synth_gefs_nc_{tag}   : tracks NC sampled from GEFS TIGGE parents
+#   synth_ecmwf_nc_{tag}  : tracks NC sampled from ECMWF TIGGE parents
+#
+# --- Flossie 2025 (EP) demo: two pipelines ---
+#   ecmwf tracks + era5 analysis env:  python run.py --ensemble --env era5
+#   gefs  tracks + gefs forecast env:  python run.py --ensemble --env gefs
+gefs_dir_flossie = data/gefs_flossie
+gefs_init_flossie = 2025-06-29 06:00
+synth_gefs_nc_flossie = tracks/processed/flossie_2025/2025062906_gefs/synthetic_tracks_1000members.nc
+synth_ecmwf_nc_flossie = tracks/processed/flossie_2025/2025062900/synthetic_tracks_1000members.nc
+#
+# --- Beryl 2024 (NA) legacy keys (kept for reproducibility) ---
 gefs_beryl_dir = data/gefs_beryl
 gefs_init = 2024-06-28 12:00
 synth_gefs_nc = tracks/processed/beryl_2024/2024062812_gefs/synthetic_tracks_1000members.nc

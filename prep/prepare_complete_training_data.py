@@ -446,13 +446,67 @@ def _disk_mask(ds, clat, clon, rmax_km):
     return xr.DataArray(d <= rmax_km, coords={lk: lats, nk: lons}, dims=(lk, nk))
 
 
+def _annulus_mean_uv(u_np, v_np, lat_np, lon_np, clat, clon,
+                     rmin=200.0, rmax=800.0):
+    """Mean (u, v) over the 200-800 km annulus; NaN-safe.
+
+    Must stay numerically IDENTICAL to the historical get_env_wnds_annulus /
+    _haversine_grid path (same R_EARTH_KM = 6378.1): the FAST/ML models were
+    trained on env winds computed that way. Operates on plain 2-D arrays so
+    it also works on regional GEFS crops. Returns (nan, nan) when the annulus
+    has < 8 valid points (box too small or center outside the grid).
+    """
+    if u_np.shape != (len(lat_np), len(lon_np)):
+        if u_np.shape == (len(lon_np), len(lat_np)):
+            u_np, v_np = u_np.T, v_np.T
+        else:
+            return np.nan, np.nan
+    phi1 = np.deg2rad(clat)
+    phi = np.deg2rad(lat_np[:, None])
+    dphi = np.deg2rad(lat_np[:, None] - clat)
+    dlam = np.deg2rad(lon_np[None, :] - clon)
+    a = np.sin(dphi / 2) ** 2 + np.cos(phi1) * np.cos(phi) \
+        * np.sin(dlam / 2) ** 2
+    d = R_EARTH_KM * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+    m = (d >= rmin) & (d <= rmax) & ~np.isnan(u_np) & ~np.isnan(v_np)
+    if m.sum() < 8:
+        return np.nan, np.nan
+    return float(u_np[m].mean()), float(v_np[m].mean())
+
+
 # ---------- Env winds ----------
 class BoundaryError(Exception):
     """Raised when vortex surgery hits ERA5 data boundary."""
     pass
 
 
+# Vortex-removal mode: 'surgery' = strict Lin et al. surgery (hard failure if
+# it cannot run, e.g. regional grid); 'annulus' = 200-800 km annulus mean
+# (the ODE training-data convention). Set via set_vortex_mode().
+VORTEX_MODE = 'annulus'
+
+
+def set_vortex_mode(mode):
+    global VORTEX_MODE
+    if mode not in ('surgery', 'annulus'):
+        raise ValueError(f"vortex mode must be 'surgery' or 'annulus', got {mode!r}")
+    VORTEX_MODE = mode
+
+
 def apply_vortex_surgery(u_2d, v_2d, lon_1d, lat_1d, storm_lon, storm_lat):
+    """Environmental wind at the storm center, vortex removed.
+
+    Two modes (global VORTEX_MODE, set via set_vortex_mode()):
+
+    'surgery' (strict): VORTEX_LIB.vortex_surgery on the FULL field, exactly
+    like Reproduce/env.py:_remove_vortex_env_wind. The library rebuilds
+    coordinates from array shape via lon_lat() (lon 0..360, lat 90..-90), so
+    the input MUST be a full-global grid; regional crops or inversion
+    failures raise BoundaryError -- NO fallback, the storm is rejected.
+
+    'annulus' (default): 200-800 km annulus mean of the same field, the ODE
+    training-data convention (get_env_wnds_annulus); NaN box -> center wind.
+    """
     ln = storm_lon + 360 if storm_lon < 0 else storm_lon
     u_np = np.asarray(u_2d, dtype=np.float64)
     v_np = np.asarray(v_2d, dtype=np.float64)
@@ -462,50 +516,61 @@ def apply_vortex_surgery(u_2d, v_2d, lon_1d, lat_1d, storm_lon, storm_lat):
         u_np, v_np = (u_np.T, v_np.T) if u_np.shape == (len(lon_np), len(lat_np)) else (u_np, v_np)
     li = np.argmin(np.abs(lat_np - storm_lat))
     lj = np.argmin(np.abs(lon_np - ln))
-    # vortex_lib.get_box needs +-n_deg (40 deg) around the vortex center on
-    # BOTH axes. Regional 0.5-deg grids (GEFS crop) can clip that box near
-    # domain edges; degrade gracefully instead of crashing the member:
-    # shrink to the largest square-ish window that fits, and if even the
-    # 25-deg caller box cannot host a >=40-deg window, fall back to the
-    # unfiltered environmental wind at the storm center.
-    d_lat = abs(float(lat_np[1] - lat_np[0]))
-    n_need = int(40 / d_lat) + 1
-    i0 = max(0, li - n_need)
-    i1 = min(len(lat_np), li + n_need + 1)
-    j0 = max(0, lj - 2 * n_need)   # lon wraps, but stay in-array
-    j1 = min(len(lon_np), lj + 2 * n_need + 1)
-    if (i1 - i0) < n_need or (j1 - j0) < 2 * n_need:
+    if VORTEX_MODE == 'annulus':
+        ue, ve = _annulus_mean_uv(u_np, v_np, lat_np, lon_np, storm_lat, ln)
+        if not (np.isnan(ue) and np.isnan(ve)):
+            return float(ue), float(ve)
         return (float(np.nan_to_num(u_np[li, lj], nan=0.0)),
                 float(np.nan_to_num(v_np[li, lj], nan=0.0)))
-    try:
-        vl = VORTEX_LIB(lon_np[j0:j1], lat_np[i0:i1], num_inv=3, xres=1)
-        _, _, uf, vf, _, _ = vl.vortex_surgery(u_np[i0:i1, j0:j1],
-                                               v_np[i0:i1, j0:j1], ln, storm_lat)
-    except (IndexError, ValueError) as e:
-        raise BoundaryError(
-            f"Vortex surgery boundary error at lat={storm_lat:.2f} lon={ln:.2f}, "
-            f"data lat=[{lat_np.min():.1f},{lat_np.max():.1f}]: {e}"
-        ) from e
-    return float(np.nan_to_num(uf[li - i0, lj - j0], nan=0.0)), float(np.nan_to_num(vf[li - i0, lj - j0], nan=0.0))
+    lon_span = float(lon_np.max() - lon_np.min())
+    lat_span = float(lat_np.max() - lat_np.min())
+    is_global = (lon_span >= 350.0) and (lat_span >= 150.0)
+    if is_global:
+        try:
+            vl = VORTEX_LIB(lon_np, lat_np, num_inv=3, xres=1)
+            _, _, uf, vf, _, _ = vl.vortex_surgery(u_np, v_np, ln, storm_lat)
+            return (float(np.nan_to_num(uf[li, lj], nan=0.0)),
+                    float(np.nan_to_num(vf[li, lj], nan=0.0)))
+        except (IndexError, ValueError) as e:
+            raise BoundaryError(
+                f"vortex_surgery inversion failed at lat={storm_lat:.2f} "
+                f"lon={ln:.2f} (global grid): {e}"
+            ) from e
+    # strict mode: no fallback allowed
+    raise BoundaryError(
+        f"vortex_surgery requires a full-global grid (lon_lat() rebuilds "
+        f"coordinates from array shape); got regional grid "
+        f"lat=[{lat_np.min():.1f},{lat_np.max():.1f}] "
+        f"lon=[{lon_np.min():.1f},{lon_np.max():.1f}] at "
+        f"lat={storm_lat:.2f} lon={ln:.2f}"
+    )
 
 
 def get_env_wnds_vortex(u_d, v_d, lat, lon, lk, latk, lonk, box=25):
+    """Env winds at 250/850 hPa via vortex surgery on the FULL grid.
+
+    Per Reproduce/env.py:_remove_vortex_env_wind: pass the whole field to
+    VORTEX_LIB (it needs global coordinates) and read the filtered wind at
+    the storm center. `box` is kept only for interface compatibility; the
+    annulus fallback inside apply_vortex_surgery is radius-based, not
+    box-based.
+    """
     if u_d is None or v_d is None or lk not in u_d.coords:
         return np.nan, np.nan, np.nan, np.nan
     lonv = np.where(np.asarray(u_d[lonk].values) < 0, np.asarray(u_d[lonk].values) + 360, u_d[lonk].values)
     latv = np.asarray(u_d[latk].values).flatten()
     ln = lon + 360 if lon < 0 else lon
+    # full-domain margin check (annulus needs +/-~8 deg around the storm)
     loi = np.where((latv >= lat - box) & (latv <= lat + box))[0]
     loi2 = np.where((lonv >= ln - box) & (lonv <= ln + box))[0]
     if len(loi) < 5 or len(loi2) < 5:
         return np.nan, np.nan, np.nan, np.nan
-    u250_box = u_d.sel({lk: 250}, method='nearest').squeeze().isel({latk: loi, lonk: loi2}).values
-    u850_box = u_d.sel({lk: 850}, method='nearest').squeeze().isel({latk: loi, lonk: loi2}).values
-    v250_box = v_d.sel({lk: 250}, method='nearest').squeeze().isel({latk: loi, lonk: loi2}).values
-    v850_box = v_d.sel({lk: 850}, method='nearest').squeeze().isel({latk: loi, lonk: loi2}).values
-    lat_1d, lon_1d = latv[loi], lonv[loi2]
-    ue250, ve250 = apply_vortex_surgery(u250_box, v250_box, lon_1d, lat_1d, ln, lat)
-    ue850, ve850 = apply_vortex_surgery(u850_box, v850_box, lon_1d, lat_1d, ln, lat)
+    u250_full = u_d.sel({lk: 250}, method='nearest').squeeze().values
+    u850_full = u_d.sel({lk: 850}, method='nearest').squeeze().values
+    v250_full = v_d.sel({lk: 250}, method='nearest').squeeze().values
+    v850_full = v_d.sel({lk: 850}, method='nearest').squeeze().values
+    ue250, ve250 = apply_vortex_surgery(u250_full, v250_full, lonv, latv, ln, lat)
+    ue850, ve850 = apply_vortex_surgery(u850_full, v850_full, lonv, latv, ln, lat)
     return ue250, ve250, ue850, ve850
 
 
@@ -1048,8 +1113,10 @@ def process_one_storm(track_csv, era5_root_override=None, sst_source='ERA5',
             out['v_init'].append(v_init_val)
 
         except BoundaryError as e:
+            # vortex_mode='surgery': surgery could not run (regional grid or
+            # inversion failure) -> reject the storm, NO fallback
             print(f"  [BOUNDARY] {track_name} step {loop_idx}: {e}")
-            print(f"  Skipping entire storm due to ERA5 boundary limitation.")
+            print(f"  Skipping entire storm (strict vortex-surgery mode).")
             close_caches(sfc_cache, pl_cache)
             return None
         except _Abort as e:

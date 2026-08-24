@@ -24,18 +24,22 @@ python run.py --ensemble --env gefs --members 5 --workers 5
 # re-plot only (reads the saved ensemble_fast.nc)
 python run.py --ensemble --env gefs --stage plot
 # or standalone:
-python ensemble/plot_ensemble_fast.py --ens-nc data/ensemble/beryl_gefs/ensemble_fast.nc \
-    --out_png data/ensemble/beryl_gefs/ensemble_fast.png --storm BERYL
+python ensemble/plot_ensemble_fast.py --ens-nc data/ensemble/flossie_gefs/ensemble_fast.nc \
+    --out_png data/ensemble/flossie_gefs/ensemble_fast.png --storm FLOSSIE
 ```
 
-Everything each command needs is in `config.txt`:
+Everything each command needs is in `config.txt`. Per-storm keys use the
+lowercase storm tag (`{id}_{NAME}` -> `flossie`):
 
 | key | meaning |
 |---|---|
-| `gefs_beryl_dir` / `gefs_init` | local GEFS forecast nc dir + init time |
-| `synth_gefs_nc` / `synth_ecmwf_nc` | synthetic-track NCs each mode reads |
+| `gefs_dir_{tag}` / `gefs_init_{tag}` | local GEFS forecast nc dir + init time |
+| `synth_gefs_nc_{tag}` / `synth_ecmwf_nc_{tag}` | synthetic-track NCs each mode reads |
 | `era5_dir` / `oisst_dir` | local analysis crops (env fields, SST) |
 | `storms`, `n_workers` | storm selection, process-pool size |
+
+Legacy Beryl keys (`gefs_beryl_dir`, `synth_gefs_nc`, ...) still work as
+fallbacks when no per-storm key exists.
 
 ## Ensemble outputs (`data/ensemble/beryl_{gefs\|era5}/`)
 

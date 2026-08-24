@@ -51,11 +51,19 @@ def load_cfg(path=None):
 
 
 def discover_storms(cfg, only=None):
-    """Yield (basin, year, storm_dir) for storms listed in config or --storms."""
+    """Yield (basin, year, storm_dir) for storms listed in config or --storms.
+
+    When explicit storm names are given (only), every basin directory is
+    scanned so cross-basin storms (e.g. EP Flossie with basins=NA) resolve.
+    """
     root = PROJECT_ROOT / cfg.get('output_dir', 'data/ibtracs')
     basins = [b.strip().upper() for b in cfg.get('basins', 'NA').split(',') if b.strip()]
+    explicit = only is not None
     if 'ALL' in basins:
         basins = ['NA', 'EP']
+    if explicit:
+        basins = sorted(d.name for d in root.iterdir()
+                        if d.is_dir() and not d.name.startswith('_')) or basins
     y0, y1 = int(cfg.get('year_start', 2024)), int(cfg.get('year_end', 2024))
     want = set(only) if only else None
     out = []
@@ -122,17 +130,35 @@ def _ode_one(job):
 # ---------- Ensemble mode (track x GEFS-member forecast) ----------
 
 GEFS_ENS_MEMBERS = ['c00'] + [f'p{i:02d}' for i in range(1, 31)]  # 31 members
+ECMWF_ENS_MEMBERS = [f'e{i:02d}' for i in range(0, 51)]           # 51 members
 
 
-def resolve_member_assignment(synth_nc, n_members, assign):
-    """Map synthetic track index -> GEFS member code.
+def resolve_member_assignment(synth_nc, n_members, assign, env):
+    """Map synthetic-track index -> environment-member code.
 
-    'ecmwf': NC carries parent_track (ECMWF e00-e50 parents); member index
-             = parent_track[i] % 31 (51 parents -> 31 GEFS members).
-    'gefs' : NC's parent_members attrs are GEFS codes (c00/p01..p30) -> use
-             the parent directly (self-consistent track & environment).
-    'round_robin': track i -> GEFS_ENS_MEMBERS[i % 31] (balanced fallback).
-    Returns (codes[n], parents_used | None).
+    The mapping depends on BOTH the parents carried by the synth NC
+    (parent_track + parent_members attr) and the env field source (--env):
+
+    assign='auto' (default, resolved by env before the call):
+      env='era5'  -> 'ecmwf'   (member code is bookkeeping only)
+      env='gefs'  -> 'gefs'
+
+    'gefs'       : NC's parent_members attr holds GEFS codes (c00/p01..p30)
+                   -> use the parent directly (self-consistent track & env:
+                   the perturbation that generated the track also drives it).
+    'ecmwf'      : NC's parents are ECMWF codes (e00..e50) but the env source
+                   is GEFS/ERA5 -> bijective one-to-one hash
+                   member = GEFS_ENS_MEMBERS[(parent * 7) % 31]. The old
+                   parent % 31 was NON-uniform (51 parents: e00-e19 hit twice,
+                   e20-e50 once); the multiplicative hash with gcd(7,31)=1
+                   gives every GEFS member exactly ceil/floor(51/31) parents
+                   and every parent exactly one member (injective per parent).
+    'ecmwf_field': future --env ecmwf with ECMWF forecast fields; reads the
+                   ECMWF parent code directly (e00..e50, one-to-one with the
+                   driving perturbation).
+    'round_robin': track i -> GEFS_ENS_MEMBERS[i % 31] (balanced fallback
+                   when the NC carries no parent info).
+    Returns codes[:n_members].
     """
     import numpy as np
     import xarray as xr
@@ -140,15 +166,19 @@ def resolve_member_assignment(synth_nc, n_members, assign):
     n_total = ds.sizes['track']
     n_members = min(n_members, n_total)
     codes = None
-    if assign in ('ecmwf', 'gefs') and 'parent_track' in ds:
+    if assign in ('ecmwf', 'gefs', 'ecmwf_field') and 'parent_track' in ds:
         pt = ds['parent_track'].values[:n_members]
         attr = str(ds.attrs.get('parent_members', ''))
-        parents = attr.split(',') if attr else []
+        parents = [p for p in attr.split(',') if p]
         if assign == 'gefs' and parents and parents[0].startswith(('c', 'p')):
             codes = [parents[int(k)] if int(k) < len(parents) else 'c00'
                      for k in pt]
-        else:
-            codes = [GEFS_ENS_MEMBERS[int(k) % len(GEFS_ENS_MEMBERS)]
+        elif assign == 'ecmwf_field' and parents and parents[0].startswith('e'):
+            codes = [parents[int(k)] if int(k) < len(parents) else parents[0]
+                     for k in pt]
+        elif assign == 'ecmwf':
+            # uniform bijective hash 51 ECMWF parents -> 31 GEFS members
+            codes = [GEFS_ENS_MEMBERS[(int(k) * 7) % len(GEFS_ENS_MEMBERS)]
                      for k in pt]
     if codes is None:
         codes = [GEFS_ENS_MEMBERS[i % len(GEFS_ENS_MEMBERS)]
@@ -184,6 +214,7 @@ def _ens_prep_batch(batch):
     if not batch:
         return out
     env = batch[0][6] if len(batch[0]) > 6 else 'gefs'
+    vortex_mode = batch[0][7] if len(batch[0]) > 7 else 'annulus'
     _, track_csv, out_dir, member_code, gefs_init, gefs_dir = batch[0][:6]
     try:
         sys.path.insert(0, str(PROJECT_ROOT / 'prep'))
@@ -193,6 +224,7 @@ def _ens_prep_batch(batch):
             gefs_nc_adapter.set_active_member(member_code, gefs_init, gefs_dir)
             gefs_nc_adapter.install()
         import prepare_complete_training_data as prep
+        prep.set_vortex_mode(vortex_mode)
         import gc
         for job in batch:
             mi, track_csv, out_dir, member_code, gefs_init, gefs_dir = job[:6]
@@ -281,15 +313,29 @@ def run_ensemble(args, cfg):
         print(f'Missing synthetic NC {synth_nc}')
         return
     n_members = args.members
-    codes = resolve_member_assignment(synth_nc, n_members, args.assign)
-    n_members = len(codes)
     env = getattr(args, 'env', 'gefs')
+    vortex_mode = getattr(args, 'vortex_mode', 'annulus')
+    codes = resolve_member_assignment(synth_nc, n_members, args.assign, env=env)
+    n_members = len(codes)
+    if vortex_mode == 'surgery' and env == 'gefs':
+        print('[ens] ERROR: vortex_mode=surgery requires full-global env '
+              'fields; GEFS crops are regional (45x70 deg). Use --env era5 '
+              'for strict surgery.')
+        return
 
     out_root = Path(args.out_root)
     out_root.mkdir(parents=True, exist_ok=True)
-    print(f'[ens] {n_members} members | env={env} | assign={args.assign} | '
+    print(f'[ens] {n_members} members | env={env} | vortex={vortex_mode} | '
+          f'assign={args.assign} | '
           f'synth={synth_nc.parent.name} | init={args.gefs_init}'
           + (f' | gefs_dir={args.gefs_dir}' if env == 'gefs' else ''))
+    # record the experiment config next to the outputs for reproducibility
+    with open(out_root / 'run_config.txt', 'w') as f:
+        f.write(f'storm={sd.name}\nenv={env}\nvortex_mode={vortex_mode}\n'
+                f'members={n_members}\nassign={args.assign}\n'
+                f'synth_nc={synth_nc}\ngefs_init={args.gefs_init}\n'
+                f'duration_h={args.duration_h}\n'
+                f'gefs_dir={args.gefs_dir if env == "gefs" else ""}\n')
 
     # ---- stage eprep: build per-member track CSV then env dataset ----
     bt = _load_best_track(bt_pkl)
@@ -319,7 +365,7 @@ def run_ensemble(args, cfg):
             f.write(f'track_idx={mi}\ngefs_member={codes[mi]}\n'
                     f'env={env}\ninit_time={args.gefs_init}\n')
         jobs.append((mi, csv_path, mdir, codes[mi], args.gefs_init,
-                     args.gefs_dir, env))
+                     args.gefs_dir, env, vortex_mode))
 
     stages = [s.strip().lower() for s in args.stage.split(',') if s.strip()]
     t0 = time.time()
@@ -340,8 +386,8 @@ def run_ensemble(args, cfg):
             for k in range(0, len(mj), size):
                 batches.append(mj[k:k + size])
         print(f'[ens eprep] {len(jobs)} member preps in {len(batches)} batches '
-              f'(env={env}, {len(by_member)} member groups), '
-              f'workers={args.workers}')
+              f'(env={env}, {len(by_member)} member groups, '
+              f'vortex={vortex_mode}), workers={args.workers}')
         n_ok = 0
         with ProcessPoolExecutor(max_workers=args.workers,
                                  initializer=_worker_init) as ex:
@@ -629,21 +675,35 @@ def main():
                          'fields (member-paired); era5 = ERA5 analysis fields '
                          '(pairs with ECMWF-sampled tracks by default)')
     ap.add_argument('--synth-nc', default='',
-                    help='synthetic_tracks_*.nc (ensemble mode)')
-    ap.add_argument('--gefs-init', default='2024-06-28 12:00',
-                    help='GEFS forecast init time (ensemble mode)')
-    ap.add_argument('--gefs-dir', default='data/gefs_beryl',
-                    help='local GEFS nc dir (ensemble mode)')
+                    help='synthetic_tracks_*.nc (ensemble mode); default from '
+                         'config.txt: {storm}_synth_gefs_nc / {storm}_synth_ecmwf_nc')
+    ap.add_argument('--gefs-init', default='',
+                    help='GEFS forecast init time (ensemble mode); default '
+                         'from config.txt gefs_init_{storm} or gefs_init')
+    ap.add_argument('--gefs-dir', default='',
+                    help='local GEFS nc dir (ensemble mode); default from '
+                         'config.txt gefs_dir_{storm} or gefs_{storm}_dir')
     ap.add_argument('--members', type=int, default=1000,
                     help='number of ensemble members to run')
-    ap.add_argument('--assign', default='',
-                    choices=['', 'ecmwf', 'gefs', 'round_robin'],
-                    help='env-member assignment mode (ensemble mode); default '
-                         'ecmwf for --env era5, gefs for --env gefs')
+    ap.add_argument('--assign', default='auto',
+                    choices=['auto', 'ecmwf', 'gefs', 'ecmwf_field',
+                             'round_robin'],
+                    help='env-member assignment (ensemble mode). auto: gefs '
+                         'for --env gefs, ecmwf otherwise. ecmwf = uniform '
+                         'one-to-one hash ECMWF parents -> GEFS members; '
+                         'gefs = parent GEFS member directly; ecmwf_field = '
+                         'ECMWF parent code directly (future --env ecmwf); '
+                         'round_robin = balanced fallback')
     ap.add_argument('--out-root', default='',
                     help='ensemble output root (default data/ensemble/{storm})')
     ap.add_argument('--duration-h', type=float, default=240.0,
                     help='forecast duration in hours per member')
+    ap.add_argument('--vortex-mode', default='annulus',
+                    choices=['annulus', 'surgery'],
+                    help='vortex removal for env winds: annulus (200-800 km '
+                         'mean, ODE training convention, default) or surgery '
+                         '(strict Lin et al. vortex surgery on full-global '
+                         'fields; any failure rejects the member)')
     args = ap.parse_args()
 
     cfg = load_cfg(args.config)
@@ -651,26 +711,44 @@ def main():
     cfg_storms = [s.strip() for s in cfg.get('storms', '').split(',') if s.strip() and s.strip().upper() != 'ALL']
     if not args.storms:
         args.storms = ','.join(cfg_storms)
-    # ensemble-mode defaults from config.txt
-    if not args.gefs_init or args.gefs_init == '2024-06-28 12:00':
-        args.gefs_init = cfg.get('gefs_init', '2024-06-28 12:00')
-    if not args.gefs_dir or args.gefs_dir == 'data/gefs_beryl':
-        args.gefs_dir = cfg.get('gefs_beryl_dir', 'data/gefs_beryl')
 
     if args.ensemble:
+        # Per-storm config resolution: keys are lowercase storm-dir names
+        # without the leading id, e.g. flossie / beryl (from
+        # 2025180N13261_FLOSSIE -> 'flossie').
+        storms_arg = [s for s in args.storms.split(',') if s.strip()]
+        tag = storms_arg[0].split('_', 1)[-1].lower() if storms_arg else 'storm'
+        if not args.gefs_init:
+            args.gefs_init = (cfg.get(f'gefs_init_{tag}')
+                              or cfg.get('gefs_init', ''))
+        if not args.gefs_dir:
+            args.gefs_dir = (cfg.get(f'gefs_dir_{tag}')
+                             or cfg.get(f'gefs_{tag}_dir')
+                             or cfg.get('gefs_beryl_dir', ''))
         if not args.synth_nc:
-            key = 'synth_gefs_nc' if args.env == 'gefs' else 'synth_ecmwf_nc'
-            args.synth_nc = cfg.get(key, '')
+            key = (f'synth_gefs_nc_{tag}' if args.env == 'gefs'
+                   else f'synth_ecmwf_nc_{tag}')
+            args.synth_nc = (cfg.get(key)
+                             or cfg.get('synth_gefs_nc' if args.env == 'gefs'
+                                        else 'synth_ecmwf_nc', ''))
         if not args.synth_nc:
             print('--ensemble requires --synth-nc (or config '
-                  'synth_gefs_nc/synth_ecmwf_nc)')
+                  f'synth_gefs_nc_{tag} / synth_ecmwf_nc_{tag})')
             return
-        if not args.assign:
+        if args.assign == 'auto':
             args.assign = 'gefs' if args.env == 'gefs' else 'ecmwf'
+        if args.assign == 'ecmwf_field' and args.env != 'ecmwf':
+            print('[ens] NOTE: assign=ecmwf_field pairs tracks with their ECMWF '
+                  'parent member; use it once --env ecmwf (ECMWF forecast '
+                  'fields) is available. Continuing (code is recorded in '
+                  'member_assignment.txt only).')
         if not args.out_root:
+            # carry the full experiment configuration in the directory name:
+            # {storm}_{env-source}_{vortex-removal}[_{n}m]
+            mem_tag = '' if args.members >= 1000 else f'_{args.members}m'
             args.out_root = str(PROJECT_ROOT / 'data' / 'ensemble'
-                                / ('beryl_gefs' if args.env == 'gefs'
-                                   else 'beryl_era5'))
+                                / f'{tag}_{args.env}_{args.vortex_mode}'
+                                  f'{mem_tag}')
         if not args.workers:
             args.workers = int(cfg.get('n_workers', 4))
         if args.stage in ('prep,ode', ''):
