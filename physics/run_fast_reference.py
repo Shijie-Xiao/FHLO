@@ -91,10 +91,6 @@ def _safe(x, default):
     return float(default) if np.isnan(x) else float(x)
 
 
-def _coeff_from_cd(cd, h_bl):
-    return 0.5 * float(cd) / float(h_bl) * 3600.0
-
-
 def _median_filter(arr, size=3):
     arr = np.asarray(arr, dtype=np.float64)
     n = len(arr)
@@ -158,28 +154,8 @@ def fast_step_coupled(xs, V, m, beta, vp, coeff, ut, vt, hm, strat, bathy,
 
 
 def calculate_m0(v, dv_dt, alpha, beta, gamma, vp, coeff):
-    vp = _safe(vp, 0.0); alpha = _safe(alpha, 1.0)
-    beta = _safe(beta, 0.57); gamma = _safe(gamma, 0.43)
-    num = dv_dt / (coeff + 1e-12) + v**2
-    den = alpha * beta * vp**2 + gamma * v**2
-    return float(np.clip(np.power(np.clip(num / (den + 1e-8), 0, None), 1.0/3.0), 0.01, 1.0))
-
-
-def fast_step(xs, V, m, alpha, beta, gamma, vp, coeff, dV_extra=0.0):
-    """One Heun (2nd-order) integration step split into 4 sub-steps by caller."""
-    vp = _safe(vp, 0.0); alpha = _safe(alpha, 1.0)
-    beta = _safe(beta, 0.57); gamma = _safe(gamma, 0.43); xs = _safe(xs, 0.0)
-    dV = coeff * (alpha * beta * vp**2 * m**3 - (1.0 - gamma * m**3) * V**2) + dV_extra
-    dm = coeff * ((1.0 - m) * V - xs * m)
-    V_mid = max(0.0, min(200.0, V + dV * STEP_SIZE))
-    m_mid = max(0.0, min(1.0, m + dm * STEP_SIZE))
-    dV2 = coeff * (alpha * beta * vp**2 * m_mid**3 - (1.0 - gamma * m_mid**3) * V_mid**2) + dV_extra
-    dm2 = coeff * ((1.0 - m_mid) * V_mid - xs * m_mid)
-    return (max(0.0, min(200.0, V + 0.5*(dV+dV2)*STEP_SIZE)),
-            max(0.0, min(1.0, m + 0.5*(dm+dm2)*STEP_SIZE)))
-
-
-def calculate_m0(v, dv_dt, alpha, beta, gamma, vp, coeff):
+    """Official _init_m inversion: solve dV/dt = 0 for m given current V
+    (dvdt=0 in cold start)."""
     vp = _safe(vp, 0.0); alpha = _safe(alpha, 1.0)
     beta = _safe(beta, 0.57); gamma = _safe(gamma, 0.43)
     num = dv_dt / (coeff + 1e-12) + v**2
@@ -447,11 +423,16 @@ def run_fast_with_init(scalars, xs_ref, v_gt, env_wnds, utran, vtran, lats, s_re
 
 # ---------- Process one pkl ----------
 
-def process_one_pkl(pkl_path, save_csv=True, save_plot=True, out_dir=None, ode_mode='fhlo'):
+def process_one_pkl(pkl_path, save_csv=True, save_plot=True, out_dir=None, ode_mode='fhlo',
+                    vp_comp=1.0):
     """Run the FAST ODE on one *_dataset.pkl. Returns summary dict.
 
     Ocean coupling is always dynamic (official coupled_fast Eq. 4-5);
-    h_bl fixed per basin, Cd varies along the track (read_drag chain)."""
+    h_bl fixed per basin, Cd varies along the track (read_drag chain).
+    vp_comp: multiplicative potential-intensity compensation (1.0 = none);
+    run.py sets the configured default (e.g. 1.1 for GEFS forecast fields,
+    whose Vp runs 5-10% low vs ERA5 analysis) -- a systematic-bias
+    correction, not case tuning."""
     pkl_path = Path(pkl_path)
     with open(pkl_path, 'rb') as f:
         data = pickle.load(f)
@@ -459,6 +440,8 @@ def process_one_pkl(pkl_path, save_csv=True, save_plot=True, out_dir=None, ode_m
     scalars = np.array(data['scalars'], dtype=np.float64, copy=True)
     T = scalars.shape[1]
     scalars[0, :, 3] = _median_filter(scalars[0, :, 3], size=3)
+    if vp_comp != 1.0:
+        scalars[0, :, 3] = scalars[0, :, 3] * float(vp_comp)
 
     chi_cal = _chi_calibrated(data['chi_ref'])
     xs_ref = np.maximum(np.nan_to_num(chi_cal * data['s_ref'], nan=XS_NAN_FALLBACK), XS_NAN_FALLBACK)
@@ -523,6 +506,9 @@ def main():
                         'cold = no replay, V(0) from first obs, m(0) via '
                         'official _init_m inversion. Ocean coupling is '
                         'always dynamic (official standard).')
+    p.add_argument('--vp-comp', type=float, default=1.0,
+                   help='multiplicative Vp compensation (GEFS forecast fields '
+                        'default 1.1 via run.py/config; 1.0 = none)')
     args = p.parse_args()
 
     pkls = [Path(x) for x in args.pkl]
@@ -534,8 +520,10 @@ def main():
     for pkl_path in pkls:
         try:
             r = process_one_pkl(pkl_path, save_csv=not args.no_csv,
-                                save_plot=not args.no_plot, ode_mode=args.ode_mode)
-            print(f"[OK] {r['storm']} mode={args.ode_mode} MAE={r['mae_kts']:.1f} kts")
+                                save_plot=not args.no_plot, ode_mode=args.ode_mode,
+                                vp_comp=args.vp_comp)
+            print(f"[OK] {r['storm']} mode={args.ode_mode} vp_comp={args.vp_comp} "
+                  f"MAE={r['mae_kts']:.1f} kts")
         except Exception as e:
             print(f'[FAIL] {pkl_path}: {e}')
 
