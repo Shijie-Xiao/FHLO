@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""Run FAST reference ODE on prepared dataset pkl files (single-track, self-contained).
+"""Run the FAST intensity ODE on prepared dataset pkl files (single track).
 
 Pipeline position: run.py stage 3 (after prep/prepare_complete_training_data.py).
 
-Logic (identical to ODE/run_fast_reference.py):
-  - 48h init with Vtarget (V_axisym from obs inversion)
-  - F forcing accumulation during init, smoothed window=12
-  - Forecast with F_init_end * exp(-(lead/24)^2) decay
-  - 4 sub-steps per hour
-  - axi_to_max_wind for V_axisym -> V_max conversion
-Removed vs the old version: basin discovery loops, legacy config plumbing,
-duplicate trailing helper copies. This file only needs numpy/pandas/matplotlib.
+Cold-start forecast only -- NO observation nudging of any kind:
+  - V(0) from the FIRST observed vmax inverted to its axisymmetric value
+    (the only observation used, at the forecast start time)
+  - m(0) from the official _init_m inversion at dvdt=0 (physically
+    equilibrated moisture for that V)
+  - free-physics Heun integration, 4 sub-steps per hour, no replay, no F
+  - dynamic ocean coupling every sub-step (official coupled_fast Eq. 4-5)
+  - Cd via the official read_drag chain, h_bl per-basin (namelist atm_bl_depth)
+  - axi_to_max_wind converts V_axisym -> V_max at the end
+This file only needs numpy/pandas/matplotlib.
 """
 
 import argparse
@@ -30,12 +32,9 @@ STEP_SIZE = 1.0 / 4.0
 CHI_D = 5.0
 # Lin et al. official chi calibration (tropical_cyclone_risk namelist +
 # util/compute.py): chi_eff = clip(exp(log(chi+1e-3) + log_chi_fac) + chi_fac,
-# 1e-5, 5) with log_chi_fac=0.5, chi_fac=1.3. Replaces clip(chi*5, 0, 4).
+# 1e-5, 5) with log_chi_fac=0.5, chi_fac=1.3.
 LOG_CHI_FAC = 0.5
 CHI_FAC = 1.3
-VMAX_START_MS = 45 * 0.514444
-INIT_HOURS = 48
-T0_DECAY_HOURS = 24.0
 Cd_CONST = 1.2e-3
 # Official namelist atm_bl_depth per basin (m): the ONLY h_bl source.
 ATM_BL_DEPTH = {'NA': 1400.0, 'EP': 1400.0, 'WP': 1800.0, 'AU': 1800.0,
@@ -224,23 +223,15 @@ def axi_to_max_wind(tc_v, s_ref, env_wnds, utran, vtran, lats):
 
 # ---------- Main FAST integration ----------
 
-def run_fast_with_init(scalars, xs_ref, v_gt, env_wnds, utran, vtran, lats, s_ref, lons=None, data=None,
-                       ode_mode='fhlo'):
-    """ode_mode:
-      'fhlo' (default): 48h obs nudging replay + forecast-phase F forcing decay
-              (FHLO setting: F carries the replay-window physics residual into
-              the forecast, decaying as exp(-(t/t0)^2), t0 = 1 day).
-      'free': keep the 48h replay (initial state + m history) but apply NO
-              forecast-phase F forcing.
-      'cold': fully cold start -- no replay, no F. V(0) from the first valid
-              observed vmax (inverted to axisymmetric), m(0) from the official
-              _init_m inversion at dvdt=0.
+def run_fast_cold(scalars, xs_ref, v_gt, env_wnds, utran, vtran, lats, s_ref, lons=None, data=None):
+    """Cold-start FAST forecast -- the ONLY mode (no obs replay, no F).
+
+    V(0) from the first valid observed vmax (inverted to axisymmetric) at the
+    forecast start; m(0) from the official _init_m inversion at dvdt=0.
     Ocean coupling is ALWAYS dynamic (official coupled_fast Eq. 4-5): alpha is
     recomputed from the CURRENT intensity every sub-step using h_m/t_strat/
     bathy from the monthly climatology along the track; gamma = eps + alpha*
     kappa, beta constant."""
-    free_mode = (ode_mode == 'free')
-    cold_mode = (ode_mode == 'cold')
     T = scalars.shape[1]
     sc = np.array(scalars[0, :, :], dtype=np.float64)
     vp = sc[:, 3]  # scalars[:,0:3] (alpha/beta/gamma) unused: dynamic alpha only
@@ -312,118 +303,43 @@ def run_fast_with_init(scalars, xs_ref, v_gt, env_wnds, utran, vtran, lats, s_re
         a = np.asarray(vtran).reshape(-1); vt[:min(len(a), T)] = a[:T]
     s_r = np.nan_to_num(np.asarray(s_ref).reshape(T, -1)[:, 0], nan=0.0) if s_ref is not None else np.zeros(T)
 
-    # Vtarget = V_axisym(obs) via bisection inversion
+    # Vtarget = V_axisym(obs) via bisection inversion (only the FIRST valid
+    # value is used, as the cold-start V(0))
     Vtarget = np.full(T, np.nan)
     for i in range(T):
         if np.isnan(v_obz[i]) or v_obz[i] <= 0:
             continue
         Vtarget[i] = _invert_vmax_to_V_axisym(v_obz[i], s_r[i], ew[i], ut[i], vt[i], la[i])
 
-    # Find 45kts start, init period. The forecast start is the FIRST 45-kt
-    # crossing and is NEVER shifted: if fewer than 48 h of pre-start obs
-    # exist, the replay window is simply clipped to the data start
-    # (user-specified 45-kt-start semantics; no t_start translation).
-    t_40 = next((i for i in range(T)
-                 if not np.isnan(v_obz[i]) and v_obz[i] >= VMAX_START_MS), None)
-    t_start = t_40 if t_40 is not None else 0
-    t_init_start = max(0, t_start - INIT_HOURS)
-    if t_start > T:
-        t_start = T; t_init_start = max(0, t_start - INIT_HOURS)
-
     v_fast = np.full(T, np.nan); m_series = np.full(T, np.nan)
-    if cold_mode:
-        # Fully cold start: V(0) from the first valid observed vmax (inverted),
-        # m(0) from the official _init_m inversion at dvdt=0 (the physically
-        # equilibrated moisture for the current V; TCR convention when an
-        # observed vortex exists). Then free physics integration, no F.
-        i0 = next((i for i in range(T) if np.isfinite(Vtarget[i]) and Vtarget[i] > 0), None)
-        if i0 is None:
-            return v_fast, np.full(T, np.nan), m_series
-        V = np.float64(max(float(Vtarget[i0]), 5.0))
-        _a0 = compute_alpha_dynamic(float(V), hm_arr[i0], vp[i0],
-                                    float(np.hypot(ut[i0], vt[i0])),
-                                    strat_arr[i0], bathy_arr[i0])
-        m = np.float64(np.clip(calculate_m0(float(V), 0.0, _a0, BETA,
-                                            EPSILON + _a0 * KAPPA,
-                                            vp[i0], coeff_arr[i0]),
-                               0.01, 1.0))
-        for t in range(i0, T):
-            for _ in range(4):
-                V, m = fast_step_coupled(xs[t], V, m, BETA, vp[t],
-                                         coeff_arr[t], ut[t], vt[t], hm_arr[t],
-                                         strat_arr[t], bathy_arr[t])
-            v_fast[t] = float(V)
-            m_series[t] = float(m)
-        v_max = axi_to_max_wind(v_fast, s_r, ew, ut, vt, la)
-        return v_fast, v_max, m_series
-
-    if t_init_start >= T:
+    # Cold start: V(0) from the first valid observed vmax (inverted), m(0)
+    # from the official _init_m inversion at dvdt=0 (the physically
+    # equilibrated moisture for the current V). Free physics, no F.
+    i0 = next((i for i in range(T) if np.isfinite(Vtarget[i]) and Vtarget[i] > 0), None)
+    if i0 is None:
         return v_fast, np.full(T, np.nan), m_series
-
-    v0 = float(Vtarget[t_init_start]) if not np.isnan(Vtarget[t_init_start]) else 5.0
-    if v0 <= 0:
-        v0 = 5.0
-    V = np.float64(v0)
-
-    dv_dt = 0.0
-    if t_init_start + 1 < T and np.isfinite(Vtarget[t_init_start]) and np.isfinite(Vtarget[t_init_start+1]):
-        dv_dt = Vtarget[t_init_start+1] - Vtarget[t_init_start]
-    # m(0) via the official _init_m inversion with the CURRENT dynamic alpha
-    _a0 = compute_alpha_dynamic(v0, hm_arr[t_init_start], vp[t_init_start],
-                                float(np.hypot(ut[t_init_start], vt[t_init_start])),
-                                strat_arr[t_init_start], bathy_arr[t_init_start])
-    _g0 = EPSILON + _a0 * KAPPA
-    m = np.float64(np.clip(calculate_m0(v0, dv_dt, _a0, BETA,
-                                        _g0, vp[t_init_start], coeff_arr[t_init_start]), 0.01, 1.0))
-
-    F_init_end = 0.0
-    F_history = []
-
-    for t in range(t_init_start, T):
-        coeff_t = coeff_arr[t]
-        if t < t_start:
-            # Init phase: V tracks Vtarget, accumulate forcing F (FHLO §2c)
-            Vtar_t = float(Vtarget[t]) if not np.isnan(Vtarget[t]) else V
-            Vtar_next = float(Vtarget[t+1]) if t+1 < T and not np.isnan(Vtarget[t+1]) else Vtar_t
-            observed_accel = Vtar_next - Vtar_t
-            a_t = compute_alpha_dynamic(Vtar_t, hm_arr[t], vp[t],
-                                        float(np.hypot(ut[t], vt[t])),
-                                        strat_arr[t], bathy_arr[t])
-            g_t = EPSILON + a_t * KAPPA
-            with np.errstate(invalid='ignore', divide='ignore'):
-                physics_rhs = coeff_t * (a_t * BETA * vp[t]**2 * m**3
-                                         - (1.0 - g_t * m**3) * Vtar_t**2)
-            F_t = observed_accel - (physics_rhs if np.isfinite(physics_rhs) else 0.0)
-            F_history.append(F_t)
-            if t == min(t_start, T) - 1:
-                window = min(12, len(F_history))
-                F_init_end = float(np.mean(F_history[-window:]))
-            V = np.float64(Vtar_next)
-            for _ in range(4):
-                with np.errstate(invalid='ignore', divide='ignore'):
-                    dm = coeff_t * ((1.0 - m) * Vtar_next - xs[t] * m)
-                m = np.float64(np.clip(m + dm * STEP_SIZE, 0.01, 1.0))
-        else:
-            # Forecast phase: 4 sub-steps with decaying F (FHLO: F_init *
-            # exp(-(t/t0)^2), t0 = 1 day; free mode drops F entirely)
-            lead_h = t - t_start
-            decay = np.exp(-1.0 * (lead_h / T0_DECAY_HOURS) ** 2)
-            dV_extra = F_init_end * decay if not free_mode else 0.0
-            for _ in range(4):
-                V, m = fast_step_coupled(xs[t], V, m, BETA, vp[t],
-                                         coeff_t, ut[t], vt[t], hm_arr[t],
-                                         strat_arr[t], bathy_arr[t],
-                                         dV_extra=dV_extra)
+    V = np.float64(max(float(Vtarget[i0]), 5.0))
+    _a0 = compute_alpha_dynamic(float(V), hm_arr[i0], vp[i0],
+                                float(np.hypot(ut[i0], vt[i0])),
+                                strat_arr[i0], bathy_arr[i0])
+    m = np.float64(np.clip(calculate_m0(float(V), 0.0, _a0, BETA,
+                                        EPSILON + _a0 * KAPPA,
+                                        vp[i0], coeff_arr[i0]),
+                           0.01, 1.0))
+    for t in range(i0, T):
+        for _ in range(4):
+            V, m = fast_step_coupled(xs[t], V, m, BETA, vp[t],
+                                     coeff_arr[t], ut[t], vt[t], hm_arr[t],
+                                     strat_arr[t], bathy_arr[t])
         v_fast[t] = float(V)
         m_series[t] = float(m)
-
     v_max = axi_to_max_wind(v_fast, s_r, ew, ut, vt, la)
     return v_fast, v_max, m_series
 
 
 # ---------- Process one pkl ----------
 
-def process_one_pkl(pkl_path, save_csv=True, save_plot=True, out_dir=None, ode_mode='fhlo',
+def process_one_pkl(pkl_path, save_csv=True, save_plot=True, out_dir=None,
                     vp_comp=1.0):
     """Run the FAST ODE on one *_dataset.pkl. Returns summary dict.
 
@@ -450,10 +366,10 @@ def process_one_pkl(pkl_path, save_csv=True, save_plot=True, out_dir=None, ode_m
     times = pd.to_datetime(np.asarray(times).ravel()[:T]) if times is not None \
         else pd.date_range(start='2000-01-01', periods=T, freq='h')
 
-    v_fast_ms, v_max_ms, m_series = run_fast_with_init(
+    v_fast_ms, v_max_ms, m_series = run_fast_cold(
         scalars, xs_ref, data['v_gt'], data.get('env_wnds'), data.get('utran'),
         data.get('vtran'), data.get('lats'), data['s_ref'],
-        lons=data.get('lons'), data=data, ode_mode=ode_mode,
+        lons=data.get('lons'), data=data,
     )
     v_obz_kts = np.array(data['v_gt'][0, :, 0], dtype=np.float32) * MS_TO_KNOTS
     vp_kts = np.array(scalars[0, :, 3], dtype=np.float32) * MS_TO_KNOTS
@@ -500,12 +416,6 @@ def main():
     p.add_argument('--year', type=int, default=2024)
     p.add_argument('--no_csv', action='store_true')
     p.add_argument('--no_plot', action='store_true')
-    p.add_argument('--ode-mode', default='fhlo', choices=['fhlo', 'free', 'cold'],
-                   help='fhlo = 48h obs replay + F forcing decay (default); '
-                        'free = keep 48h replay, no F forcing; '
-                        'cold = no replay, V(0) from first obs, m(0) via '
-                        'official _init_m inversion. Ocean coupling is '
-                        'always dynamic (official standard).')
     p.add_argument('--vp-comp', type=float, default=1.0,
                    help='multiplicative Vp compensation (GEFS forecast fields '
                         'default 1.1 via run.py/config; 1.0 = none)')
@@ -520,9 +430,9 @@ def main():
     for pkl_path in pkls:
         try:
             r = process_one_pkl(pkl_path, save_csv=not args.no_csv,
-                                save_plot=not args.no_plot, ode_mode=args.ode_mode,
+                                save_plot=not args.no_plot,
                                 vp_comp=args.vp_comp)
-            print(f"[OK] {r['storm']} mode={args.ode_mode} vp_comp={args.vp_comp} "
+            print(f"[OK] {r['storm']} vp_comp={args.vp_comp} "
                   f"MAE={r['mae_kts']:.1f} kts")
         except Exception as e:
             print(f'[FAIL] {pkl_path}: {e}')

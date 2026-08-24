@@ -72,7 +72,7 @@ CHI_PARAMS = {
 }
 
 # NOTE: local data is time-cropped with the FULL spatial domain kept
-# (lat 0-80N, lon 0-360E), produced by download/crop_beryl_sample.py.
+# (lat 0-80N, lon 0-360E), produced by download/crop_era5_flossie.py.
 # The pipeline reads ONLY local data (demo-shippable); the CFS archive is
 # used exclusively by the crop script.
 # Paths are resolved in _cfg_overrides() below (config.txt > env > default).

@@ -12,19 +12,18 @@ Parallelism: storms are processed concurrently with a process pool; each storm
 is sequential in time (vortex surgery caches make this the efficient order).
 
 Usage
-  python run.py                          # all storms in config (default Beryl)
-  python run.py --storms 2024181N09320_BERYL
+  python run.py                          # all storms in config (default Flossie demo)
+  python run.py --storms 2025180N13261_FLOSSIE
   python run.py --sst OISST              # SST source override
   python run.py --stage prep,ode         # skip ibtracs download
   python run.py --list                   # show discovered storms and exit
 
-Ensemble mode (full 1000-member forecast):
-  python run.py --ensemble \
-      --synth-nc tracks/processed/beryl_2024/2024062900/synthetic_tracks_1000members.nc \
-      --gefs-init '2024-06-28 12:00' --gefs-dir data/gefs_beryl \
-      --members 5 --assign ecmwf
-  Stages: eprep (track x member env prep via ensemble/gefs_nc_adapter.py,
-  vortex surgery included) then ode (FAST ODE per member).
+Ensemble mode (cold-start GEFS forecast, the demo):
+  python run.py --ensemble
+  Everything (synth NC, GEFS dir, init time, vp compensation) resolves from
+  config.txt. Stages: eprep (track x member env prep via
+  ensemble/gefs_nc_adapter.py, vortex removal included) then ode (FAST ODE
+  per member) then plot (ensemble_fast.png/svg).
 """
 import argparse
 import subprocess
@@ -118,11 +117,11 @@ def _ode_one(job):
     """Stage 3 worker: one pkl -> fast_reference csv/png. Returns (storm, ok, msg)."""
     sys.path.insert(0, str(PROJECT_ROOT / 'physics'))
     import run_fast_reference as fast
-    basin, year, storm_dir, ode_mode, vp_comp = job
+    basin, year, storm_dir, vp_comp = job
     pkl = storm_dir / f'{storm_dir.name}_dataset.pkl'
     try:
-        r = fast.process_one_pkl(pkl, ode_mode=ode_mode, vp_comp=vp_comp)
-        return storm_dir.name, True, f"[{ode_mode}] MAE={r['mae_kts']:.1f} kts"
+        r = fast.process_one_pkl(pkl, vp_comp=vp_comp)
+        return storm_dir.name, True, f"MAE={r['mae_kts']:.1f} kts"
     except Exception as e:
         return storm_dir.name, False, f'{type(e).__name__}: {e}'
 
@@ -140,8 +139,8 @@ def resolve_member_assignment(synth_nc, n_members, assign, env):
     (parent_track + parent_members attr) and the env field source (--env):
 
     assign='auto' (default, resolved by env before the call):
-      env='era5'  -> 'ecmwf'   (member code is bookkeeping only)
-      env='gefs'  -> 'gefs'
+      env='gefs'  -> 'gefs'   (demo default)
+      env='era5'  -> 'ecmwf'  (member code is bookkeeping only)
 
     'gefs'       : NC's parent_members attr holds GEFS codes (c00/p01..p30)
                    -> use the parent directly (self-consistent track & env:
@@ -266,7 +265,7 @@ def _ens_ode_one(job):
     Returns (mi, ok, msg, result) where result carries the member's V(t)
     series (v_fast/v_max/vp/v_obz/m, kts) for the ensemble NC.
     """
-    mi, out_dir, ode_mode, vp_comp = job
+    mi, out_dir, vp_comp = job
     sys.path.insert(0, str(PROJECT_ROOT / 'physics'))
     import run_fast_reference as fast
     out_dir = Path(out_dir)
@@ -275,7 +274,7 @@ def _ens_ode_one(job):
         import numpy as np
         import pandas as pd
         r = fast.process_one_pkl(pkl, save_csv=True, save_plot=False,
-                                 ode_mode=ode_mode, vp_comp=vp_comp)
+                                 vp_comp=vp_comp)
         csv = out_dir / 'fast_reference.csv'
         if csv.exists():
             df = pd.read_csv(csv)
@@ -335,7 +334,7 @@ def run_ensemble(args, cfg):
         f.write(f'storm={sd.name}\nenv={env}\nvortex_mode={vortex_mode}\n'
                 f'members={n_members}\nassign={args.assign}\n'
                 f'synth_nc={synth_nc}\ngefs_init={args.gefs_init}\n'
-                f'duration_h={args.duration_h}\node_mode={args.ode_mode}\n'
+                f'duration_h={args.duration_h}\node_mode=cold\n'
                 f'vp_comp={args.vp_comp}\n'
                 f'gefs_dir={args.gefs_dir if env == "gefs" else ""}\n')
 
@@ -410,7 +409,7 @@ def run_ensemble(args, cfg):
               f'({time.time() - t0:.0f}s)')
 
     if 'ode' in stages:
-        ode_jobs = [(i, d, args.ode_mode, args.vp_comp) for i, d in enumerate(member_dirs)
+        ode_jobs = [(i, d, args.vp_comp) for i, d in enumerate(member_dirs)
                     if (d / f'{d.name}_dataset.pkl').exists()]
         print(f'[ens ode] {len(ode_jobs)} FAST ODE runs, workers={args.workers}')
         n_ok = 0
@@ -674,17 +673,17 @@ def main():
                     help='full ensemble forecast mode (track x env member)')
     ap.add_argument('--env', default='gefs', choices=['gefs', 'era5'],
                     help='ensemble environment source: gefs = GEFS forecast '
-                         'fields (member-paired); era5 = ERA5 analysis fields '
-                         '(pairs with ECMWF-sampled tracks by default)')
+                         'fields (member-paired, demo default); era5 = ERA5 '
+                         'analysis fields (pairs with ECMWF-sampled tracks)')
     ap.add_argument('--synth-nc', default='',
                     help='synthetic_tracks_*.nc (ensemble mode); default from '
-                         'config.txt: {storm}_synth_gefs_nc / {storm}_synth_ecmwf_nc')
+                         'config.txt: synth_gefs_nc_{tag} / synth_ecmwf_nc_{tag}')
     ap.add_argument('--gefs-init', default='',
                     help='GEFS forecast init time (ensemble mode); default '
-                         'from config.txt gefs_init_{storm} or gefs_init')
+                         'from config.txt gefs_init_{tag}')
     ap.add_argument('--gefs-dir', default='',
                     help='local GEFS nc dir (ensemble mode); default from '
-                         'config.txt gefs_dir_{storm} or gefs_{storm}_dir')
+                         'config.txt gefs_dir_{tag}')
     ap.add_argument('--members', type=int, default=1000,
                     help='number of ensemble members to run')
     ap.add_argument('--assign', default='auto',
@@ -706,11 +705,6 @@ def main():
                          'mean, ODE training convention, default) or surgery '
                          '(strict Lin et al. vortex surgery on full-global '
                          'fields; any failure rejects the member)')
-    ap.add_argument('--ode-mode', default='fhlo',
-                    choices=['fhlo', 'free', 'cold'],
-                    help='FAST ODE mode: fhlo = 48h obs replay + F forcing '
-                         '(default, FHLO standard); free = replay without F; '
-                         'cold = no replay, cold start from first obs')
     ap.add_argument('--vp-comp', type=float, default=-1.0,
                     help='multiplicative Vp compensation for the env source; '
                          '-1 = take config default (GEFS 1.1 systematic-bias '
@@ -734,8 +728,7 @@ def main():
                               or cfg.get('gefs_init', ''))
         if not args.gefs_dir:
             args.gefs_dir = (cfg.get(f'gefs_dir_{tag}')
-                             or cfg.get(f'gefs_{tag}_dir')
-                             or cfg.get('gefs_beryl_dir', ''))
+                             or cfg.get(f'gefs_{tag}_dir', ''))
         if not args.synth_nc:
             key = (f'synth_gefs_nc_{tag}' if args.env == 'gefs'
                    else f'synth_ecmwf_nc_{tag}')
@@ -755,11 +748,6 @@ def main():
                                                  else cfg.get('vp_comp_era5', 1.0))))
         if args.assign == 'auto':
             args.assign = 'gefs' if args.env == 'gefs' else 'ecmwf'
-        if args.assign == 'ecmwf_field' and args.env != 'ecmwf':
-            print('[ens] NOTE: assign=ecmwf_field pairs tracks with their ECMWF '
-                  'parent member; use it once --env ecmwf (ECMWF forecast '
-                  'fields) is available. Continuing (code is recorded in '
-                  'member_assignment.txt only).')
         if not args.out_root:
             # carry the full experiment configuration in the directory name:
             # {storm}_{env-source}_{vortex-removal}[_{n}m]
@@ -779,6 +767,9 @@ def main():
     sst = args.sst or cfg.get('sst_source', 'ERA5')
     workers = args.workers or int(cfg.get('n_workers', 4))
     stages = [s.strip().lower() for s in args.stage.split(',') if s.strip()]
+    if args.vp_comp < 0:
+        # single-track mode runs on ERA5 analysis fields -> no compensation
+        args.vp_comp = float(cfg.get('vp_comp_era5', 1.0))
 
     storms = discover_storms(cfg, only=only)
     if args.list:
@@ -812,7 +803,7 @@ def main():
 
     if 'ode' in stages:
         print('[stage 3] FAST ODE')
-        jobs = [(b, y, sd) for b, y, sd in storms
+        jobs = [(b, y, sd, args.vp_comp) for b, y, sd in storms
                 if (sd / f'{sd.name}_dataset.pkl').exists()]
         n_ok = 0
         with ProcessPoolExecutor(max_workers=workers) as ex:
