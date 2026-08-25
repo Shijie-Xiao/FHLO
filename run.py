@@ -117,10 +117,12 @@ def _ode_one(job):
     """Stage 3 worker: one pkl -> fast_reference csv/png. Returns (storm, ok, msg)."""
     sys.path.insert(0, str(PROJECT_ROOT / 'physics'))
     import run_fast_reference as fast
-    basin, year, storm_dir, vp_comp = job
+    basin, year, storm_dir, vp_comp, ode_mode, replay_hours, kl_perturb = job
     pkl = storm_dir / f'{storm_dir.name}_dataset.pkl'
     try:
-        r = fast.process_one_pkl(pkl, vp_comp=vp_comp)
+        r = fast.process_one_pkl(pkl, vp_comp=vp_comp, ode_mode=ode_mode,
+                                 replay_hours=replay_hours,
+                                 kl_perturb=kl_perturb, kl_seed=100000)
         return storm_dir.name, True, f"MAE={r['mae_kts']:.1f} kts"
     except Exception as e:
         return storm_dir.name, False, f'{type(e).__name__}: {e}'
@@ -206,6 +208,9 @@ def _ens_prep_batch(batch):
     per-worker fhour cache stays hot (3-hourly slabs reused across tracks).
     env=era5 skips the adapter entirely: environment fields come from the
     local ERA5 analysis (data/era5), member_code is record-keeping only.
+    replay_hours>0 swaps gefs_nc_adapter for dual_env_adapter: ERA5
+    analysis fields before fc_start (the replay window), the GEFS member's
+    forecast fields at/after; the pkl stores fc_start for the ODE stage.
     Returns [(mi, ok, msg), ...].
     """
     import pickle
@@ -214,14 +219,23 @@ def _ens_prep_batch(batch):
         return out
     env = batch[0][6] if len(batch[0]) > 6 else 'gefs'
     vortex_mode = batch[0][7] if len(batch[0]) > 7 else 'annulus'
+    replay_hours = batch[0][8] if len(batch[0]) > 8 else 0
+    fc_start = batch[0][9] if len(batch[0]) > 9 else None
     _, track_csv, out_dir, member_code, gefs_init, gefs_dir = batch[0][:6]
     try:
         sys.path.insert(0, str(PROJECT_ROOT / 'prep'))
         if env == 'gefs':
             sys.path.insert(0, str(PROJECT_ROOT / 'ensemble'))
-            import gefs_nc_adapter
-            gefs_nc_adapter.set_active_member(member_code, gefs_init, gefs_dir)
-            gefs_nc_adapter.install()
+            if replay_hours > 0:
+                import dual_env_adapter
+                dual_env_adapter.set_active_member(
+                    member_code, fc_start=fc_start or gefs_init,
+                    init_time=gefs_init, nc_dir=gefs_dir)
+                dual_env_adapter.install()
+            else:
+                import gefs_nc_adapter
+                gefs_nc_adapter.set_active_member(member_code, gefs_init, gefs_dir)
+                gefs_nc_adapter.install()
         import prepare_complete_training_data as prep
         prep.set_vortex_mode(vortex_mode)
         import gc
@@ -245,6 +259,8 @@ def _ens_prep_batch(batch):
                 for k in ('spatial_3d', 'spatial_2d'):
                     ds.pop(k, None)
                 ds['gefs_member'] = member_code
+                if replay_hours > 0:
+                    ds['fc_start'] = str(fc_start or gefs_init)
                 with open(out_pkl, 'wb') as f:
                     pickle.dump(ds, f, protocol=4)
                 out.append((mi, True, f'T={len(ds["times"])}'))
@@ -265,7 +281,7 @@ def _ens_ode_one(job):
     Returns (mi, ok, msg, result) where result carries the member's V(t)
     series (v_fast/v_max/vp/v_obz/m, kts) for the ensemble NC.
     """
-    mi, out_dir, vp_comp = job
+    mi, out_dir, vp_comp, ode_mode, replay_hours, kl_perturb = job
     sys.path.insert(0, str(PROJECT_ROOT / 'physics'))
     import run_fast_reference as fast
     out_dir = Path(out_dir)
@@ -274,7 +290,10 @@ def _ens_ode_one(job):
         import numpy as np
         import pandas as pd
         r = fast.process_one_pkl(pkl, save_csv=True, save_plot=False,
-                                 vp_comp=vp_comp)
+                                 vp_comp=vp_comp, ode_mode=ode_mode,
+                                 replay_hours=replay_hours,
+                                 kl_perturb=kl_perturb,
+                                 kl_seed=100000 + mi)
         csv = out_dir / 'fast_reference.csv'
         if csv.exists():
             df = pd.read_csv(csv)
@@ -325,16 +344,32 @@ def run_ensemble(args, cfg):
 
     out_root = Path(args.out_root)
     out_root.mkdir(parents=True, exist_ok=True)
+    ode_mode = getattr(args, 'ode_mode', 'cold')
+    replay_hours = 0 if ode_mode == 'cold' else int(getattr(args, 'replay_hours', 48))
+    import pandas as _pd
+    # Forecast start = the ERA5->GEFS env handover time. Defaults to the GEFS
+    # init; a LATER fc_start (inside the cycle's valid window) replays obs on
+    # ERA5 analysis up to fc_start, then runs the member forecast from the
+    # same GEFS cycle's later valid times.
+    fc_start = getattr(args, 'fc_start', '') or args.gefs_init
+    if _pd.Timestamp(fc_start) < _pd.Timestamp(args.gefs_init):
+        print(f'[ens] NOTE fc_start {fc_start} < GEFS init {args.gefs_init}; '
+              f'clamping fc_start to the init')
+        fc_start = args.gefs_init
     print(f'[ens] {n_members} members | env={env} | vortex={vortex_mode} | '
           f'assign={args.assign} | '
           f'synth={synth_nc.parent.name} | init={args.gefs_init}'
+          + (f' | fc_start={fc_start}' if replay_hours > 0 else '')
           + (f' | gefs_dir={args.gefs_dir}' if env == 'gefs' else ''))
     # record the experiment config next to the outputs for reproducibility
     with open(out_root / 'run_config.txt', 'w') as f:
         f.write(f'storm={sd.name}\nenv={env}\nvortex_mode={vortex_mode}\n'
                 f'members={n_members}\nassign={args.assign}\n'
                 f'synth_nc={synth_nc}\ngefs_init={args.gefs_init}\n'
-                f'duration_h={args.duration_h}\node_mode=cold\n'
+                f'fc_start={fc_start}\n'
+                f'duration_h={args.duration_h}\node_mode={ode_mode}\n'
+                f'replay_hours={replay_hours}\n'
+                f'kl={0 if getattr(args, "no_kl", False) else 1}\n'
                 f'vp_comp={args.vp_comp}\n'
                 f'gefs_dir={args.gefs_dir if env == "gefs" else ""}\n')
 
@@ -351,6 +386,15 @@ def run_ensemble(args, cfg):
     if init_delta > 3601 and env == 'gefs':
         print(f'[ens] NOTE synth init {init_time} != GEFS init {args.gefs_init} '
               f'(env valid-time interpolation handles the offset)')
+    # replay window start: fc_start - replay_hours, clipped to the best-track
+    # record start (never pre-genesis; the ODE clips again per member)
+    window_start = _pd.Timestamp(fc_start) - _pd.Timedelta(hours=replay_hours)
+    bt_start = _pd.Timestamp(bt['time'].iloc[0])
+    if window_start < bt_start:
+        if replay_hours > 0 and window_start < bt_start:
+            print(f'[ens] replay window clipped: {window_start} -> {bt_start} '
+                  f'(IBTrACS record start)')
+        window_start = bt_start
     jobs, member_dirs = [], []
     for mi in range(n_members):
         mdir = out_root / f'{sd.name}_M{mi:03d}'
@@ -359,14 +403,19 @@ def run_ensemble(args, cfg):
         if (mdir / f'{mdir.name}_dataset.pkl').exists() and not args.overwrite:
             continue
         track = _build_member_track(bt, lons[mi], lats[mi], t_sec,
-                                    init_time, init_time, args.duration_h)
+                                    init_time, window_start, args.duration_h,
+                                    replay_hours=replay_hours,
+                                    fc_start=fc_start)
         csv_path = mdir / f'{mdir.name}_track.csv'
         track.to_csv(csv_path, index=False)
         with open(mdir / 'member_assignment.txt', 'w') as f:
             f.write(f'track_idx={mi}\ngefs_member={codes[mi]}\n'
-                    f'env={env}\ninit_time={args.gefs_init}\n')
+                    f'env={env}\ninit_time={args.gefs_init}\n'
+                    f'fc_start={fc_start}\n'
+                    f'replay_hours={replay_hours}\node_mode={ode_mode}\n')
         jobs.append((mi, csv_path, mdir, codes[mi], args.gefs_init,
-                     args.gefs_dir, env, vortex_mode))
+                     args.gefs_dir, env, vortex_mode, replay_hours,
+                     fc_start))
 
     stages = [s.strip().lower() for s in args.stage.split(',') if s.strip()]
     t0 = time.time()
@@ -388,7 +437,8 @@ def run_ensemble(args, cfg):
                 batches.append(mj[k:k + size])
         print(f'[ens eprep] {len(jobs)} member preps in {len(batches)} batches '
               f'(env={env}, {len(by_member)} member groups, '
-              f'vortex={vortex_mode}), workers={args.workers}')
+              f'vortex={vortex_mode}, replay={replay_hours}h), '
+              f'workers={args.workers}')
         n_ok = 0
         with ProcessPoolExecutor(max_workers=args.workers,
                                  initializer=_worker_init) as ex:
@@ -409,9 +459,12 @@ def run_ensemble(args, cfg):
               f'({time.time() - t0:.0f}s)')
 
     if 'ode' in stages:
-        ode_jobs = [(i, d, args.vp_comp) for i, d in enumerate(member_dirs)
+        ode_jobs = [(i, d, args.vp_comp, ode_mode, replay_hours,
+                     not getattr(args, 'no_kl', False))
+                    for i, d in enumerate(member_dirs)
                     if (d / f'{d.name}_dataset.pkl').exists()]
-        print(f'[ens ode] {len(ode_jobs)} FAST ODE runs, workers={args.workers}')
+        print(f'[ens ode] {len(ode_jobs)} FAST ODE runs (mode={ode_mode}, '
+              f'replay={replay_hours}h), workers={args.workers}')
         n_ok = 0
         results = {}
         with ProcessPoolExecutor(max_workers=args.workers,
@@ -429,20 +482,38 @@ def run_ensemble(args, cfg):
         print(f'[ens ode] done: {n_ok}/{len(ode_jobs)} '
               f'({time.time() - t0:.0f}s)')
         _save_ensemble_nc(out_root, sd.name, results, env, args.assign,
-                          args.gefs_init)
-        _summarize_ensemble(out_root, sd.name)
-        _plot_ensemble(out_root, sd.name, cfg)
+                          args.gefs_init, ode_mode=ode_mode,
+                          replay_hours=replay_hours, fc_start=fc_start)
+        _summarize_ensemble(out_root, sd.name, fc_start=fc_start
+                            if replay_hours > 0 else None)
+        _plot_ensemble(out_root, sd.name, cfg, fc_start=fc_start
+                       if replay_hours > 0 else None)
 
     if 'plot' in stages and 'ode' not in stages:
         # plot-only invocation (e.g. --stage plot) reads the saved NC
-        _plot_ensemble(out_root, sd.name, cfg)
+        rc = out_root / 'run_config.txt'
+        fc = None
+        rh = 0
+        try:
+            for ln in rc.read_text().splitlines():
+                if ln.startswith('fc_start='):
+                    fc = ln.split('=', 1)[1].strip() or None
+                elif ln.startswith('replay_hours='):
+                    rh = int(float(ln.split('=', 1)[1].strip() or 0))
+        except Exception:
+            pass
+        if rh == 0:
+            fc = None
+        _plot_ensemble(out_root, sd.name, cfg, fc_start=fc)
 
 
-def _plot_ensemble(out_root, storm_name, cfg=None):
+def _plot_ensemble(out_root, storm_name, cfg=None, fc_start=None):
     """Render ensemble_fast.png/svg from ensemble_fast.nc (FAST-only).
 
     Google FNV3 overlay keys come from config.txt when present:
-      google_csv_{tag} / google_id_{tag}  (see ensemble/download_fnv3.py)."""
+      google_csv_{tag} / google_id_{tag}  (see ensemble/download_fnv3.py).
+    fc_start: forecast start (GEFS init). With a replay window the hour
+      axis is re-origin'ed to fc_start (negative hours = ERA5 replay)."""
     out_root = Path(out_root)
     nc = out_root / 'ensemble_fast.nc'
     if not nc.exists():
@@ -461,6 +532,8 @@ def _plot_ensemble(out_root, storm_name, cfg=None):
                '--out_png', str(out_root / 'ensemble_fast.png'),
                '--storm', storm_name.split('_')[-1] if '_' in storm_name
                else storm_name]
+        if fc_start:
+            cmd += ['--fc_start', str(fc_start)]
         if g_csv and (PROJECT_ROOT / g_csv).exists():
             cmd += ['--google_csv', str(PROJECT_ROOT / g_csv)]
             if g_id:
@@ -479,12 +552,15 @@ def _plot_ensemble(out_root, storm_name, cfg=None):
         print(f'[ens plot] {type(e).__name__}: {e}')
 
 
-def _save_ensemble_nc(out_root, storm_name, results, env, assign, init_time):
+def _save_ensemble_nc(out_root, storm_name, results, env, assign, init_time,
+                      ode_mode='cold', replay_hours=0, fc_start=None):
     """Assemble per-member FAST series into ONE ensemble NetCDF.
 
     Layout (plot_vs_google_vmax.py ready):
       fast_vmax_kts (member, hour)  -- ODE Vmax
-      fast_v_kts / vp_kts / v_obz_kts / m likewise; hour = hours since init.
+      fast_v_kts / vp_kts / v_obz_kts / m likewise; hour = hours since the
+      pkl window start (fc_start - replay_hours when replaying, so negative
+      hours mark the ERA5 replay segment).
     Also fast_chi/fast_s (from prep pkls) for the vent panel, seq_len marks
     each member's valid length (ragged tracks are NaN-padded).
     """
@@ -558,16 +634,26 @@ def _save_ensemble_nc(out_root, storm_name, results, env, assign, init_time):
         fields,
         coords={'member': np.array(mis), 'hour': hours, 'time': time_coord},
         attrs={'storm': storm_name, 'env': env, 'assign': assign,
-               'init_time': str(init_time),
+               'init_time': str(init_time), 'ode_mode': str(ode_mode),
+               'replay_hours': int(replay_hours),
+               'fc_start': str(fc_start) if fc_start else '',
                'gefs_members': ','.join(codes)})
     out = out_root / 'ensemble_fast.nc'
     ds_out.to_netcdf(out)
-    peaks = np.nanmax(fields['fast_vmax_kts'][1], axis=1)
+    fc_hours = fields['fast_vmax_kts'][1]
+    if replay_hours > 0 and times0 is not None and fc_start:
+        try:
+            base0 = np.datetime64(pd.Timestamp(str(fc_start)))
+            fc_hours = np.where(hours >= (base0 - times0[0]) / np.timedelta64(1, 'h'),
+                                fc_hours, np.nan)
+        except Exception:
+            pass
+    peaks = np.nanmax(fc_hours, axis=1)
     print(f'[ens nc] saved {out} ({n} members x {T} h, '
           f'peak mean={np.nanmean(peaks):.0f} max={np.nanmax(peaks):.0f} kts)')
 
 
-def _summarize_ensemble(out_root, storm_name, save=True):
+def _summarize_ensemble(out_root, storm_name, save=True, fc_start=None):
     """Collect per-member coefficients + winds into ensemble-level files.
 
     Outputs (in out_root):
@@ -575,8 +661,9 @@ def _summarize_ensemble(out_root, storm_name, save=True):
                            v_max_kts, v_obz_kts (per ODE step)
       ensemble_summary.nc  (member, hour): chi/u250/v250/u850/v850/shear from
                            the prep pkls + per-member peak_kts
-    Prints the peak-intensity summary line.
-    """
+    fc_start: forecast start. Peak intensity is computed over the FORECAST
+    segment only (the replay window tracks obs by construction and would
+    understate the physics spread otherwise)."""
     import pickle
     import numpy as np
     import pandas as pd
@@ -596,19 +683,30 @@ def _summarize_ensemble(out_root, storm_name, save=True):
             for ln in asg.read_text().splitlines():
                 if ln.startswith('gefs_member='):
                     mem_code = ln.split('=', 1)[1].strip()
+                elif ln.startswith('fc_start=') and fc_start is None:
+                    fc_start = ln.split('=', 1)[1].strip() or None
         try:
             df = pd.read_csv(csvf)
         except Exception:
             continue
         hours = pd.to_datetime(df['time'])
         hr = (hours - hours.iloc[0]).dt.total_seconds() / 3600.0
-        obz = df.get('v_obz_kts')
-        for t, v, vo in zip(hr, df['v_max_kts'],
+        # peak over the forecast segment only (t0 = env init)
+        if fc_start is not None:
+            hr_fc = pd.Timestamp(fc_start)
+            v_fc = df['v_max_kts'].where(hours >= hr_fc, np.nan)
+            obz = df.get('v_obz_kts')
+        else:
+            obz = df.get('v_obz_kts')
+            v_fc = df['v_max_kts'].where(hr >= hr.where(obz.notna()).min(),
+                                         np.nan)
+        for t, v, vo in zip(hr, v_fc,
                             obz if obz is not None else [np.nan] * len(df)):
-            winds_rows.append((mi, mem_code, float(t), float(v),
+            winds_rows.append((mi, mem_code, float(t),
+                               float(v) if v == v else np.nan,
                                float(vo) if vo == vo else np.nan))
-        if len(df):
-            peaks.append(float(df['v_max_kts'].max()))
+        if v_fc.notna().any():
+            peaks.append(float(v_fc.max()))
         # coefficients from the prep pkl (chi + env winds per hour)
         if pklf.exists():
             try:
@@ -696,6 +794,12 @@ def main():
     ap.add_argument('--gefs-init', default='',
                     help='GEFS forecast init time (ensemble mode); default '
                          'from config.txt gefs_init_{tag}')
+    ap.add_argument('--fc-start', default='',
+                    help='forecast start / ERA5->GEFS env handover time '
+                         '(replay modes). Default: the GEFS init; may be '
+                         'later (replay obs on ERA5 analysis to fc_start, '
+                         'then run the member forecast from valid times of '
+                         'the same cycle). Config key fc_start_{tag}')
     ap.add_argument('--gefs-dir', default='',
                     help='local GEFS nc dir (ensemble mode); default from '
                          'config.txt gefs_dir_{tag}')
@@ -724,6 +828,18 @@ def main():
                     help='multiplicative Vp compensation for the env source; '
                          '-1 = take config default (GEFS 1.1 systematic-bias '
                          'correction, ERA5 1.0); explicit value overrides')
+    ap.add_argument('--ode-mode', choices=['cold', 'fhlo', 'free'],
+                    default='', help='ODE initialization: cold = pure cold '
+                    'start (demo default); fhlo = obs replay + KL + F*'
+                    'exp(-(t/24h)^2) forcing; free = replay + KL, no F. '
+                    'Default from config.txt ode_mode')
+    ap.add_argument('--replay-hours', type=int, default=-1,
+                    help='obs replay window before the forecast start '
+                         '(FHLO 48h; clipped to the IBTrACS record start); '
+                         'replay segment uses ERA5 analysis fields')
+    ap.add_argument('--no-kl', action='store_true',
+                    help='disable the KL(n=10) observed-history perturbation '
+                         '(replay/fhlo modes)')
     args = ap.parse_args()
 
     cfg = load_cfg(args.config)
@@ -761,15 +877,31 @@ def main():
                                          cfg.get(f'vp_comp_{args.env}',
                                                  cfg.get('vp_comp_gefs', 1.1) if args.env == 'gefs'
                                                  else cfg.get('vp_comp_era5', 1.0))))
+        if not args.ode_mode:
+            args.ode_mode = cfg.get('ode_mode', 'cold').strip().lower()
+        if args.replay_hours < 0:
+            args.replay_hours = int(float(cfg.get('replay_hours', 48)))
+        if args.ode_mode == 'cold':
+            args.replay_hours = 0
+        if not args.fc_start:
+            args.fc_start = (cfg.get(f'fc_start_{tag}')
+                             or cfg.get('fc_start', ''))
+        if args.ode_mode in ('fhlo', 'free'):
+            fc_msg = args.fc_start or args.gefs_init
+            print(f'[ens] ode_mode={args.ode_mode}: replay {args.replay_hours} h '
+                  f'(ERA5 analysis) before the forecast start {fc_msg}, '
+                  f'clipped to the IBTrACS record start')
         if args.assign == 'auto':
             args.assign = 'gefs' if args.env == 'gefs' else 'ecmwf'
         if not args.out_root:
             # carry the full experiment configuration in the directory name:
-            # {storm}_{env-source}_{vortex-removal}[_{n}m]
+            # {storm}_{env-source}[_{mode}][_replay{N}][_ vortex]...
             mem_tag = '' if args.members >= 1000 else f'_{args.members}m'
+            mode_tag = '' if args.ode_mode == 'cold' else \
+                f'_{args.ode_mode}{args.replay_hours}'
             args.out_root = str(PROJECT_ROOT / 'data' / 'ensemble'
-                                / f'{tag}_{args.env}_{args.vortex_mode}'
-                                  f'{mem_tag}')
+                                / f'{tag}_{args.env}{mode_tag}'
+                                  f'_{args.vortex_mode}{mem_tag}')
         if not args.workers:
             args.workers = int(cfg.get('n_workers', 4))
         if args.stage in ('prep,ode', ''):
@@ -818,7 +950,14 @@ def main():
 
     if 'ode' in stages:
         print('[stage 3] FAST ODE')
-        jobs = [(b, y, sd, args.vp_comp) for b, y, sd in storms
+        ode_mode = cfg.get('ode_mode', 'cold').strip().lower()
+        replay_hours = int(float(cfg.get('replay_hours', 48)))
+        if ode_mode == 'cold':
+            replay_hours = 0
+        jobs = [(b, y, sd, args.vp_comp, ode_mode, replay_hours,
+                 cfg.get('kl_perturb', '1').strip().lower() not in
+                 ('0', 'false', 'no', 'off'))
+                for b, y, sd in storms
                 if (sd / f'{sd.name}_dataset.pkl').exists()]
         n_ok = 0
         with ProcessPoolExecutor(max_workers=workers) as ex:

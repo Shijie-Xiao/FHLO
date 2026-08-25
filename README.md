@@ -48,6 +48,26 @@ member's forecast fields; `--env era5` uses the local ERA5 analysis for every
 member. `--assign` controls the track→member mapping (`gefs`, `ecmwf` hash,
 `round_robin`; `auto` picks by `--env`).
 
+### ODE initialization modes (`--ode-mode`, config `ode_mode`)
+
+```bash
+# FHLO Sec.2c init: obs replay + KL(n=10) + F*exp(-(t/24h)^2) forcing
+python run.py --ensemble --ode-mode fhlo
+
+# replay + KL, no forecast-phase forcing (free physics from replayed state)
+python run.py --ensemble --ode-mode free
+```
+
+With a later GEFS init than the IBTrACS record start (e.g. `--gefs-init
+"2025-06-30 12:00"`), the environment chain becomes **dual-source**: the
+replay window `[fc_start - replay_hours, fc_start)` runs on ERA5 analysis
+fields (Lin et al. 2020 Sec.3e convention) while the forecast segment runs
+on the selected GEFS member. The replay window is always clipped to the
+IBTrACS record start — never extrapolated pre-genesis — and degenerates to
+a cold start automatically when the record starts at/after `fc_start`
+(the shipped 06-29 06Z demo case). `--no-kl` disables the appendix-B KL
+perturbation; `--replay-hours` sets the window (default 48 h).
+
 ## Configuration (`config.txt`)
 
 | key | meaning |
@@ -59,6 +79,9 @@ member. `--assign` controls the track→member mapping (`gefs`, `ecmwf` hash,
 | `synth_ecmwf_nc_flossie` | optional ECMWF-parent NC for `--env era5` |
 | `era5_dir` | local ERA5 analysis crop (SST/BLH/MSL fallback chain) |
 | `vp_comp_gefs` / `vp_comp_era5` | Vp bias compensation (1.1 / 1.0) |
+| `ode_mode` | ODE init: `cold` (default) / `fhlo` (obs replay + KL + F) / `free` |
+| `replay_hours` | obs replay window before fc_start (48; clipped to IBTrACS start) |
+| `kl_perturb` | 1 = KL(n=10) observed-history perturbation (appendix B) |
 | `n_workers` | process-pool size |
 
 `era5_root` / `oisst_root` / `ecmwf_root` / `gefs_grib_root` point at the
@@ -163,9 +186,10 @@ run.py                       single entry: prep/eprep/ode/plot orchestration
 config.txt                   all paths + experiment knobs
 ens_flossie_gefs_default.slurm  HPC batch wrapper (1000 members)
 prep/      IBTrACS download; env extraction + scalars (dataset.pkl)
-physics/   run_fast_reference.py — FAST cold-start ODE (the only ODE)
+physics/   run_fast_reference.py — FAST ODE (cold / fhlo replay / free)
 tracks/    TIGGE -> Markov -> 1000-member synthetic tracks
-ensemble/  gefs_nc_adapter.py (GEFS nc -> env fields), plot_ensemble_fast.py
+ensemble/  gefs_nc_adapter.py (GEFS env), dual_env_adapter.py (ERA5 replay
+           + GEFS forecast routing), plot_ensemble_fast.py, download_fnv3.py
 common/    thermo tables, vortex-inversion surgery library, spherical utils
 download/  crop scripts that BUILT data/era5 + data/gefs_flossie (optional)
 data/      local data (gitignored; ship via Google Drive)
@@ -185,8 +209,11 @@ data/      local data (gitignored; ship via Google Drive)
 ## Reproducibility notes
 
 - `run_config.txt` next to each ensemble output records the exact
-  configuration (storm, env source, vortex mode, members, vp_comp, init).
+  configuration (storm, env source, vortex mode, members, vp_comp, init,
+  ode_mode, replay_hours, KL).
 - Reruns are resumable: existing per-member `_dataset.pkl`s are skipped
   unless `--overwrite`.
-- The cold-start ODE is deterministic per member; ensemble spread comes
-  entirely from the 1000 synthetic tracks x 31 GEFS parent members.
+- In `cold` mode the ODE is deterministic per member; spread comes entirely
+  from the 1000 synthetic tracks x 31 GEFS parent members. In `fhlo`/`free`
+  modes the KL(n=10) observed-history perturbation (seed `100000 + member
+  id`, deterministic) adds IC spread on top, exactly per FHLO appendix B.

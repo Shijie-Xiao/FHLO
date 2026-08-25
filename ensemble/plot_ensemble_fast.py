@@ -35,6 +35,10 @@ def main():
     p.add_argument("--out_png", required=True)
     p.add_argument("--storm", default=None)
     p.add_argument("--init_time", default=None)
+    p.add_argument("--fc_start", default=None,
+                   help="forecast start (GEFS init); with a replay window "
+                        "the hour axis is re-origin'ed here: negative hours "
+                        "= ERA5 replay segment, 0+ = GEFS forecast")
     p.add_argument("--google_csv", default=None,
                    help="optional Google FNV3 paired CSV overlay")
     p.add_argument("--google_id", default=None)
@@ -50,11 +54,19 @@ def main():
     s = ds["fast_s"].values if "fast_s" in ds else None
     init = args.init_time or str(ds.attrs.get("init_time", ""))
     env = str(ds.attrs.get("env", ""))
+    mode = str(ds.attrs.get("ode_mode", "cold"))
+    rep_h = int(ds.attrs.get("replay_hours", 0) or 0)
     nmem = ds.sizes["member"]
+    time0 = ds["time"].values[0] if "time" in ds.coords else None
     ds.close()
 
     T = fast.shape[1]
     h = np.arange(T, dtype=float)
+    # re-origin the hour axis to the forecast start when replaying
+    replayed = bool(args.fc_start) and rep_h > 0
+    if replayed and time0 is not None:
+        h = h - float((np.datetime64(pd.Timestamp(args.fc_start)) - time0)
+                      / np.timedelta64(1, "h"))
     # mask beyond each member's valid length
     if sl is not None:
         for m in range(fast.shape[0]):
@@ -74,12 +86,15 @@ def main():
     # Google overlay (optional; CSV from ensemble/download_fnv3.py)
     g_lead = g_mean = g_topm = g_p10 = g_p90 = g_mat = None
     nG = 0
+    g_init = ""
     if args.google_csv and Path(args.google_csv).exists():
         g = pd.read_csv(args.google_csv, comment="#")
         if args.google_id:
             g = g[g["track_id"] == args.google_id]
         gcol = "maximum_sustained_wind_speed_knots"
         g = g.copy()
+        if "init_time" in g.columns and len(g):
+            g_init = str(pd.Timestamp(g["init_time"].iloc[0]))
         g["lead_h"] = (pd.to_timedelta(g["lead_time"]).dt.total_seconds()
                        / 3600.0 + args.google_lead_shift_h)
         g_lead = np.sort(g["lead_h"].unique())
@@ -128,7 +143,9 @@ def main():
             label=f"FAST top10% (peak {np.nanmax(fa_top):.0f})")
     if g_mean is not None:
         ax.plot(g_lead, g_mean, color="#dc2626", lw=2.2, marker="o", ms=4,
-                zorder=8, label=f"Google FNV3 mean (peak {np.nanmax(g_mean):.0f}, {nG} mem)")
+                zorder=8,
+                label=f"Google FNV3 mean, init {pd.Timestamp(g_init):%m-%d %HZ} "
+                      f"(peak {np.nanmax(g_mean):.0f}, {nG} mem)")
         ax.plot(g_lead, g_topm, color="#dc2626", lw=1.8, ls="--", marker="s",
                 ms=3.5, mfc="none", zorder=8,
                 label=f"Google FNV3 top10% (peak {np.nanmax(g_topm):.0f})")
@@ -136,20 +153,38 @@ def main():
                 zorder=7, label="Google FNV3 p90")
     xmax = args.max_hours if args.max_hours is not None else \
         max(Tobs, float(g_lead.max()) if g_lead is not None else 0)
-    ax.set_xlim(0, xmax)
+    xmin = float(h[0]) if replayed else 0.0
+    ax.set_xlim(xmin, xmax)
+    if replayed:
+        ax.axvline(0.0, color="#2563eb", lw=1.4, ls="-.", alpha=0.8)
+        ax.text(0.985, 0.02,
+                f"forecast start {pd.Timestamp(args.fc_start):%m-%d %HZ} "
+                f"(h<0: ERA5 obs replay, not forecast)",
+                transform=ax.transAxes, fontsize=8.5, color="#2563eb",
+                ha="right")
     ax.set_ylim(0, max(160, np.nanmax(obs0[:Tobs]) + 30))
     ax.grid(alpha=0.25)
     ax.set_ylabel("Intensity (kt)")
     sname = (args.storm or "").strip().upper()
     envlab = {"gefs": "GEFS fcst env", "era5": "ERA5 analysis env"}.get(env, env)
-    gtxt = " vs Google FNV3" if g_mean is not None else ""
+    gtxt = "" if g_mean is None else \
+        f" vs Google FNV3 (init {g_init})"
+    mtxt = "" if mode in ("", "cold") else \
+        f", {mode} init ({rep_h}h obs replay)"
+    fc_txt = f", fc start {pd.Timestamp(args.fc_start):%m-%d %HZ}" \
+        if replayed else f", init {init}" if init else ""
     ax.set_title((f"{sname}: " if sname else "")
-                 + f"FAST ensemble ({nmem} members, {envlab}){gtxt} vs IBTrACS",
+                 + f"FAST ensemble ({nmem} members, {envlab}{mtxt}"
+                   f"{fc_txt}){gtxt} vs IBTrACS",
                  fontweight="bold")
     ax.legend(loc="upper right", fontsize=9, ncol=2, framealpha=0.9)
 
     # ---- bottom: vent chi*s ----
-    xlab = "Hours since init" + (f"   (init: {init})" if init else "")
+    if replayed:
+        xlab = (f"Hours since forecast start {pd.Timestamp(args.fc_start):%m-%d %HZ} "
+                f"(GEFS init: {init}; h<0: ERA5 obs replay)")
+    else:
+        xlab = "Hours since init" + (f"   (init: {init})" if init else "")
     if two:
         axv.fill_between(h, v_lo, v_hi, color="#16a34a", alpha=0.15)
         axv.plot(h, v_mean, color="#16a34a", lw=2.2,
@@ -168,9 +203,17 @@ def main():
     fig.savefig(out.with_suffix(".svg"), format="svg", bbox_inches="tight")
     plt.close(fig)
     peaks = np.nanmax(fast, axis=1)
+    if replayed:
+        m_fc = h >= 0
+        fa_mean_pk = np.nanmax(fa_mean[m_fc])
+        fa_top_pk = np.nanmax(fa_top[m_fc])
+        peaks = np.nanmax(np.where(m_fc[None, :], fast, np.nan), axis=1)
+    else:
+        fa_mean_pk = np.nanmax(fa_mean)
+        fa_top_pk = np.nanmax(fa_top)
     print(f"  saved {out.with_suffix('.svg')}")
-    print(f"  FAST mean peak={np.nanmax(fa_mean):.0f} "
-          f"top10%={np.nanmax(fa_top):.0f} | "
+    print(f"  FAST mean peak={fa_mean_pk:.0f} "
+          f"top10%={fa_top_pk:.0f} | "
           f"member peaks p10={np.nanpercentile(peaks,10):.0f} "
           f"p50={np.nanpercentile(peaks,50):.0f} "
           f"p90={np.nanpercentile(peaks,90):.0f} | "

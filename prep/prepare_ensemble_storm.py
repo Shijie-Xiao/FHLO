@@ -2,10 +2,15 @@
 # -*- coding: utf-8 -*-
 """Ensemble-member track builders shared by the ensemble preparation pipeline.
 
-Provides the three helpers consumed by ensemble/run_prep_div1000.py:
+Provides the three helpers consumed by run.py --ensemble:
   _load_best_track    -- rebuild hourly (time, lat, lon, vmax_kts) from BT *_dataset.pkl
   _load_synthetic     -- read synthetic_tracks NC, pick N members by seed
   _build_member_track -- splice best-track prepend + synthetic hourly track per member
+
+When replay_hours > 0 the synthetic track starts replay_hours BEFORE the
+forecast start (fc_start = GEFS init): the pre-forecast window rides the
+best-track positions/observations (the replay is obs-driven), the synthetic
+member track takes over at fc_start.
 
 Track CSV convention (consumed by prepare_complete_training_data.process_track_data):
   columns = time, lat, lon(0..360), vmax(knots)
@@ -62,19 +67,32 @@ def _load_synthetic(synthetic_nc, n_members, seed):
 
 
 def _build_member_track(best_track_df, synth_lons, synth_lats, synth_t_sec,
-                        init_time, reference_time, duration_h):
-    """Splice best-track prepend [ref,init) + hourly-upsampled synthetic [init, ref+dur].
+                        init_time, reference_time, duration_h,
+                        replay_hours=0, fc_start=None):
+    """Splice best-track prepend + hourly-upsampled synthetic track.
 
-    vmax column always borrows the best-track value at matching time (ffill if missing).
+    init_time = the synthetic-track NC init (synth t=0, normally the GEFS
+    cycle). fc_start = the forecast start, where the synthetic member track
+    takes over (defaults to init_time; may be LATER when the experiment
+    hands the environment over at a valid time inside the cycle).
+    reference_time = window start = fc_start - replay_hours (the replay
+    window; clipped to the best-track record start): over [reference_time,
+    fc_start) the track rides best-track positions (obs replay).
+    vmax column always borrows the best-track value at matching time
+    (ffill if missing); over [fc_start, fc_start+duration) it holds the
+    observed vmax (replay diagnostics / verification), never nudging the
+    forecast.
     """
-    synth_times = init_time + pd.to_timedelta(synth_t_sec, unit='s')
-    end_time = reference_time + pd.Timedelta(hours=duration_h)
+    fc0 = pd.Timestamp(fc_start) if fc_start is not None \
+        else pd.Timestamp(init_time)
+    synth_times = pd.Timestamp(init_time) + pd.to_timedelta(synth_t_sec, unit='s')
+    end_time = fc0 + pd.Timedelta(hours=duration_h)
     mask = synth_times <= end_time
     synth_times = synth_times[mask]
     synth_lons = synth_lons[mask]
     synth_lats = synth_lats[mask]
 
-    hourly_synth_times = pd.date_range(init_time, synth_times[-1], freq='h')
+    hourly_synth_times = pd.date_range(fc0, synth_times[-1], freq='h')
     synth_lon_hourly = np.interp(
         hourly_synth_times.view('int64'), synth_times.view('int64'), synth_lons)
     synth_lat_hourly = np.interp(
@@ -82,9 +100,12 @@ def _build_member_track(best_track_df, synth_lons, synth_lats, synth_t_sec,
 
     bt = best_track_df[
         (best_track_df['time'] >= reference_time) &
-        (best_track_df['time'] < init_time)
+        (best_track_df['time'] < fc0)
     ].copy()
-    bt = bt.set_index('time').asfreq('h').interpolate('linear').reset_index()
+    if len(bt):
+        bt = bt.set_index('time').asfreq('h').interpolate('linear').reset_index()
+    else:
+        bt = bt.set_index('time').asfreq('h').reset_index()
 
     syn = pd.DataFrame({
         'time': hourly_synth_times,
