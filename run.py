@@ -90,6 +90,60 @@ def stage_ibtracs(cfg):
     return r.returncode == 0
 
 
+def _wind_stage(out_root, storm_name, cfg, args, fc_start=None):
+    """Stage wind: FHLO wind-field probability maps (34/50/64 kt) from an
+    existing ensemble_fast.nc. Direct port of the official FHLO wind model:
+    CLE15 radial profile + shape parameter k + translation/shear asymmetry,
+    (r0,k) initialized from IBTrACS quadrant wind radii at fc_start."""
+    out_root = Path(out_root)
+    nc = out_root / 'ensemble_fast.nc'
+    if not nc.exists():
+        print(f'[ens wind] missing {nc}, skip')
+        return
+    if not fc_start:
+        rc = out_root / 'run_config.txt'
+        try:
+            for ln in rc.read_text().splitlines():
+                if ln.startswith('fc_start='):
+                    fc_start = ln.split('=', 1)[1].strip() or None
+        except Exception:
+            pass
+    sid = storm_name.split('_')[0]
+    tag = storm_name.split('_', 1)[-1].lower() if '_' in storm_name else ''
+    ibtracs_csv = ''
+    for key in (f'ibtracs_radii_{tag}', 'ibtracs_radii'):
+        ibtracs_csv = cfg.get(key, '')
+        if ibtracs_csv:
+            break
+    if not ibtracs_csv:
+        cache = PROJECT_ROOT / 'data' / 'ibtracs' / '_cache'
+        cands = sorted(cache.glob(f'ibtracs.*.list.v04r01.csv')) \
+            if cache.exists() else []
+        ibtracs_csv = str(cands[0]) if cands else ''
+    if not Path(ibtracs_csv).exists() and not \
+            (PROJECT_ROOT / ibtracs_csv).exists():
+        print(f'[ens wind] IBTrACS radii csv not found '
+              f'({ibtracs_csv or "no cache"}); r0/k fall back to defaults')
+        ibtracs_csv = ''
+    cmd = [sys.executable, '-u', '-m', 'wind.wind_prob',
+           '--ens', str(out_root), '--storm', storm_name,
+           '--thresholds', args.wind_thresholds,
+           '--window-h', str(args.wind_window_h),
+           '--grid', str(args.wind_grid)]
+    if fc_start:
+        cmd += ['--fc-start', str(fc_start)]
+    if ibtracs_csv:
+        cmd += ['--ibtracs', ibtracs_csv, '--sid', sid]
+    print(f'[ens wind] FHLO wind-field probabilities '
+          f'({" ".join(cmd[3:7])} ...)')
+    r = subprocess.run(cmd, cwd=PROJECT_ROOT)
+    if r.returncode != 0:
+        print('[ens wind] FAILED')
+    else:
+        print(f'[ens wind] saved {out_root / "wind_prob.nc"} '
+              f'+ wind_prob.png/svg')
+
+
 def _prep_one(job):
     """Stage 2 worker: one storm -> dataset pkl. Returns (storm, ok, msg)."""
     import pickle
@@ -488,6 +542,8 @@ def run_ensemble(args, cfg):
                             if replay_hours > 0 else None)
         _plot_ensemble(out_root, sd.name, cfg, fc_start=fc_start
                        if replay_hours > 0 else None)
+        if 'wind' in stages:
+            _wind_stage(out_root, sd.name, cfg, args, fc_start=fc_start)
 
     if 'plot' in stages and 'ode' not in stages:
         # plot-only invocation (e.g. --stage plot) reads the saved NC
@@ -505,6 +561,24 @@ def run_ensemble(args, cfg):
         if rh == 0:
             fc = None
         _plot_ensemble(out_root, sd.name, cfg, fc_start=fc)
+
+    if 'wind' in stages:
+        # wind-field probability stage (works on a saved ensemble_fast.nc,
+        # so plot-only invocations can add it: --stage wind)
+        rc = out_root / 'run_config.txt'
+        fc = None
+        rh = 0
+        try:
+            for ln in rc.read_text().splitlines():
+                if ln.startswith('fc_start='):
+                    fc = ln.split('=', 1)[1].strip() or None
+                elif ln.startswith('replay_hours='):
+                    rh = int(float(ln.split('=', 1)[1].strip() or 0))
+        except Exception:
+            pass
+        if rh == 0:
+            fc = None
+        _wind_stage(out_root, sd.name, cfg, args, fc_start=fc)
 
 
 def _plot_ensemble(out_root, storm_name, cfg=None, fc_start=None):
@@ -839,7 +913,15 @@ def main():
                          'replay segment uses ERA5 analysis fields')
     ap.add_argument('--no-kl', action='store_true',
                     help='disable the KL(n=10) observed-history perturbation '
-                         '(replay/fhlo modes)')
+                    '(replay/fhlo modes)')
+    ap.add_argument('--wind-thresholds', default='34,50,64',
+                    help='wind-probability thresholds in kt (ensemble wind '
+                         'stage), comma-separated')
+    ap.add_argument('--wind-window-h', type=float, default=-1,
+                    help='wind-probability window in hours from fc_start; '
+                         '-1 = full ensemble record after fc_start')
+    ap.add_argument('--wind-grid', type=float, default=0.25,
+                    help='wind-probability analysis grid spacing in degrees')
     args = ap.parse_args()
 
     cfg = load_cfg(args.config)

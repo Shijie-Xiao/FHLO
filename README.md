@@ -32,7 +32,6 @@ python run.py --ensemble --stage plot
 python ensemble/plot_ensemble_fast.py --ens-nc data/ensemble/flossie_gefs/ensemble_fast.nc \
     --out_png data/ensemble/flossie_gefs/ensemble_fast.png --storm FLOSSIE
 ```
-
 On an HPC with Slurm, `sbatch ens_flossie_gefs_default.slurm` runs the same
 command (1000 members, 128 workers).
 
@@ -57,6 +56,30 @@ python run.py --ensemble --ode-mode fhlo
 # replay + KL, no forecast-phase forcing (free physics from replayed state)
 python run.py --ensemble --ode-mode free
 ```
+
+### Wind-field probability stage (`--stage wind`)
+
+The FHLO surface-wind model turns the intensity ensemble into 34/50/64-kt
+wind-exceedance probability maps (Lin et al. 2020 Sec.3d-e; probability
+definition per DeMaria 2009):
+
+```bash
+# appended to a full run (runs right after ode+plot):
+python run.py --ensemble --stage eprep,ode,plot,wind
+
+# or standalone on any existing ensemble_fast.nc (auto-finds IBTrACS radii
+# in data/ibtracs/_cache, window = full record after fc_start):
+python run.py --ensemble --stage wind
+
+# knobs: thresholds, window, grid spacing
+python run.py --ensemble --stage wind --wind-thresholds 34,50,64 \
+    --wind-window-h 120 --wind-grid 0.25
+```
+
+Outputs `wind_prob.nc` (probability + member counts on a lat/lon grid) and
+`wind_prob.png/svg` (map background, ensemble tracks, best track, 10/50%
+contours; <5% probabilities are treated as no-signal and left transparent,
+per NHC convention). See "Wind-field model" below for the physics chain.
 
 With a later GEFS init than the IBTrACS record start (e.g. `--gefs-init
 "2025-06-30 12:00"`), the environment chain becomes **dual-source**: the
@@ -111,6 +134,8 @@ zero additional downloads.
 | `ensemble_fast.png/.svg` | spaghetti + mean/top10% + obs + vent panel (auto after ode) |
 | `ensemble_winds.csv` | long-format V(t) per member (easy pandas) |
 | `ensemble_summary.nc` | per-member coefficients: chi, u/v 250/850, shear, peak_kts |
+| `wind_prob.nc` | 34/50/64-kt wind-exceedance probability on a lat/lon grid (`--stage wind`) |
+| `wind_prob.png/.svg` | probability maps with map background + tracks (auto with wind stage) |
 | `{STORM}_M{NNN}/` | per-member slim `_dataset.pkl`, `fast_reference.csv`, `_track.csv`, `member_assignment.txt` |
 | `run_config.txt` | exact config used (env, vortex mode, members, vp_comp) |
 
@@ -140,6 +165,13 @@ synthetic_tracks_1000members.nc ──┐ hourly splice w/ best-track vmax
               ensemble_fast.nc + ensemble_winds.csv + ensemble_summary.nc
                                   ▼
               ensemble_fast.png/svg  (ensemble/plot_ensemble_fast.py)
+                                  ▼
+              run.py --stage wind  (wind/wind_prob.py)
+                CLE15(V_axisym(t), r0, lat) -> V(r) -> shape-k ->
+                translation/shear asymmetry -> per-member 2-D field ->
+                DeMaria(2009) "ever-exceeded" probability per grid point
+                                  ▼
+              wind_prob.nc + wind_prob.png/svg  (34/50/64-kt)
 ```
 
 - **Vortex removal**: `annulus` (200–800 km mean, default) on the regional
@@ -182,7 +214,7 @@ Details: `tracks/README.md`. The demo never requires this step.
 ## Repository layout
 
 ```
-run.py                       single entry: prep/eprep/ode/plot orchestration
+run.py                       single entry: prep/eprep/ode/plot/wind orchestration
 config.txt                   all paths + experiment knobs
 ens_flossie_gefs_default.slurm  HPC batch wrapper (1000 members)
 prep/      IBTrACS download; env extraction + scalars (dataset.pkl)
@@ -190,6 +222,8 @@ physics/   run_fast_reference.py — FAST ODE (cold / fhlo replay / free)
 tracks/    TIGGE -> Markov -> 1000-member synthetic tracks
 ensemble/  gefs_nc_adapter.py (GEFS env), dual_env_adapter.py (ERA5 replay
            + GEFS forecast routing), plot_ensemble_fast.py, download_fnv3.py
+wind/      CLE15 profile port + shape-k + asymmetry + (r0,k) radii fit +
+           wind-exceedance probability maps (run.py --stage wind)
 common/    thermo tables, vortex-inversion surgery library, spherical utils
 download/  crop scripts that BUILT data/era5 + data/gefs_flossie (optional)
 data/      local data (gitignored; ship via Google Drive)
@@ -205,6 +239,35 @@ data/      local data (gitignored; ship via Google Drive)
 - **Integration**: Heun, 4 sub-steps per hour; V_axisym → V_max via the
   translation + 0.1·s·V/15 shear-tilt conversion at the end.
 - **75% survival rule** for Markov track training/sampling horizon.
+
+## Wind-field model (`wind/`)
+
+Direct port of the official FHLO wind model (Lin et al. 2020 Sec.3d-e) that
+converts each member's `V_axisym(t)` time series into a full 2-D surface
+wind field:
+
+1. **CLE15 radial profile** (`wind/cle15.py`): Python-3 port of the official
+   Chavas, Lin & Emanuel (2015) code (PURR DOI 10.4231/CZ4P-D448) — merges
+   the Emanuel & Rotunno (2011) inner solution with the Emanuel (2004)
+   outer solution at fixed `r0`. FHLO simplifications: `2Cd/w_cool = 1 s-1`,
+   `Ck/Cd = 1`, `Cd = 1.5e-3`.
+2. **Shape parameter k** (`wind_field.apply_shape_k`): `V(r,k) = V(r)^k`
+   for `r > rm`, correcting the CLE15 low bias at 3 ≤ r/rm ≤ 6.
+3. **Asymmetry** (`wind_field._asym_increment`): translation `G·ut`
+   (G latitude-dependent per Lin) + shear `0.1·s·V/15`, total increment
+   capped at 50% of `V` — identical to `physics/run_fast_reference.py`.
+4. **(r0, k) initialization** (`wind/init_radii.py`): joint two-stage grid
+   fit of `(r0, k, V_axisym)` to the IBTrACS 34/50/64-kt quadrant radii +
+   Vmax analysis at `fc_start` (falls back to r0=700 km, k=1 with no radii).
+5. **Probability** (`wind/wind_prob.py`): per-member "ever exceeded" flag
+   over the window, divided by member count (DeMaria 2009 definition). A
+   precomputed (V, lat) profile lookup table makes the 1000-member × 162-h
+   run take ~10 min instead of hours.
+
+Plotting (`wind/plot_wind_prob.py`) follows the repo's `tracks/plot_tracks.py`
+conventions: cartopy land/ocean background, probability fill transparent
+below 5%, gray member spaghetti, blue ensemble mean, black IBTrACS best
+track, 10%/50% contours.
 
 ## Reproducibility notes
 

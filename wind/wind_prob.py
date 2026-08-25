@@ -240,11 +240,23 @@ def main():
         for ln in cfg.splitlines():
             if ln.startswith('fc_start='):
                 fc_start = ln.split('=', 1)[1].strip()
+    if not fc_start:
+        raise SystemExit('need --fc-start (or fc_start= in run_config.txt)')
+
+    window_h = args.window_h
+    if window_h < 0:
+        # full record after fc_start
+        t = pd.DatetimeIndex(xr.open_dataset(
+            Path(args.ens) / 'ensemble_fast.nc')['time'].values)
+        t0 = pd.Timestamp(fc_start)
+        window_h = float((t[-1] - t0).total_seconds() / 3600 + 1)
+        print(f'[wind] full-record window: {window_h:.0f} h '
+              f'after {fc_start}')
     thresholds = [float(t) for t in args.thresholds.split(',')]
 
     ds, aux = compute_probabilities(
         args.ens, args.storm, thresholds, fc_start,
-        window_h=args.window_h, ddeg=args.grid,
+        window_h=window_h, ddeg=args.grid,
         ibtracs_csv=args.ibtracs or None, sid=args.sid or None)
 
     out = Path(args.out) if args.out else Path(args.ens) / 'wind_prob.nc'
