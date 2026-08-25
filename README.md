@@ -1,282 +1,104 @@
 # FHLO — Forecasts of Hurricanes Using Large-Ensemble Outputs
 
-Physics-based hurricane intensity ensemble forecasting following
-Lin, Emanuel & Vigh (2020), *Wea. Forecasting*, 35, 1713–1731, with the χ
-calibration and (Ck, h_bl) constants aligned to
+A self-contained implementation of **FHLO** (Lin, Emanuel & Vigh 2020,
+*Wea. Forecasting*, 35, 1713–1731), a physics-based ensemble hurricane
+intensity forecasting system. This repository reproduces the full
+pipeline from operational forecast fields to probabilistic intensity and
+wind-exceedance products, with all constants calibrated to
 [linjonathan/tropical_cyclone_risk](https://github.com/linjonathan/tropical_cyclone_risk).
 
-**This repository is a self-contained demo**: Hurricane Flossie 2025 (EP),
-GEFS 06-29 06Z init, 1000-member **cold-start** forecast. All code and all
-data needed to reproduce the results live inside this directory — no
-external paths, no external packages beyond the conda env, no observation
-nudging anywhere in the forecast (the only observation ever used is the
-initial vmax at t=0).
+## What is reproduced
+
+| Component | Reference |
+|---|---|
+| Synthetic track ensemble (Markov resampling of TIGGE parents) | Lin et al. 2020, Sec. 3a–b |
+| Environmental field extraction + vortex removal | Lin et al. 2020, Sec. 3c |
+| FAST intensity ODE (Emanuel 2012 coupled air–sea) | Lin et al. 2020, Sec. 3d |
+| χ calibration, (Ck, h_bl) constants, ocean feedback α | Lin et al. 2020 + Lin namelist |
+| ODE initialization (cold / obs-replay / KL perturbation) | Lin et al. 2020, Sec. 2c + appendix B |
+| Surface wind field (CLE15 + shape-k + asymmetry) | Lin et al. 2020, Sec. 3d–e |
+| 34/50/64-kt wind-exceedance probability | DeMaria 2009 |
+
+## Physics chain
+
+```
+TIGGE parents ──Markov──> 1000 synthetic tracks
+                                │
+GEFS / ERA5 fields ──vortex removal──> env winds, χ, s, shear, Vp
+                                │
+                     FAST ODE:  dV/dt = (Vp−V)·|χ_eff·s| / (h_bl·V)
+                                │
+                     CLE15 wind field -> 34/50/64-kt probability maps
+```
+
+- **FAST ODE** (Emanuel 2012): intensity evolves toward potential
+  intensity Vp under ventilation χ_eff·s; Heun integration, 4 sub-steps/h.
+- **Dynamic ocean feedback**: α recomputed from current V every 15-min
+  sub-step using monthly MLD/strat climatology + bathymetry; γ = ε + ακ.
+- **Wind model**: CLE15 axisymmetric profile (Chavas, Lin & Emanuel 2015,
+  official code ported) + shape parameter k + translation/shear asymmetry;
+  (r0, k) fitted to IBTrACS quadrant wind radii at initialization.
 
 ## Quick start
 
 ```bash
 conda env create -f environment.yml && conda activate fast_ml
 
-# ---- THE one-command full reproduction ----
-python run.py --ensemble
-#   eprep (1000 members x GEFS env) -> ode (FAST cold start) -> plot
-#   everything (synth NC, GEFS dir, init time, Vp compensation) resolves
-#   from config.txt; output lands in data/ensemble/flossie_gefs/
-
-# quick sanity check (5 members, foreground)
-python run.py --ensemble --members 5 --workers 5
-
-# re-plot only (reads the saved ensemble_fast.nc)
-python run.py --ensemble --stage plot
-# or standalone:
-python ensemble/plot_ensemble_fast.py --ens-nc data/ensemble/flossie_gefs/ensemble_fast.nc \
-    --out_png data/ensemble/flossie_gefs/ensemble_fast.png --storm FLOSSIE
-```
-On an HPC with Slurm, `sbatch ens_flossie_gefs_default.slurm` runs the same
-command (1000 members, 128 workers).
-
-### Optional chains (kept selectable; GEFS is the default)
-
-```bash
-# ERA5 analysis env instead of GEFS forecast env (ECMWF-sampled tracks)
-python run.py --ensemble --env era5
-```
-
-`--env gefs` (default) pairs each synthetic track with its parent GEFS
-member's forecast fields; `--env era5` uses the local ERA5 analysis for every
-member. `--assign` controls the track→member mapping (`gefs`, `ecmwf` hash,
-`round_robin`; `auto` picks by `--env`).
-
-### ODE initialization modes (`--ode-mode`, config `ode_mode`)
-
-```bash
-# FHLO Sec.2c init: obs replay + KL(n=10) + F*exp(-(t/24h)^2) forcing
-python run.py --ensemble --ode-mode fhlo
-
-# replay + KL, no forecast-phase forcing (free physics from replayed state)
-python run.py --ensemble --ode-mode free
-```
-
-### Wind-field probability stage (`--stage wind`)
-
-The FHLO surface-wind model turns the intensity ensemble into 34/50/64-kt
-wind-exceedance probability maps (Lin et al. 2020 Sec.3d-e; probability
-definition per DeMaria 2009):
-
-```bash
-# appended to a full run (runs right after ode+plot):
+# full pipeline (prep -> ode -> plot -> wind probability)
 python run.py --ensemble --stage eprep,ode,plot,wind
 
-# or standalone on any existing ensemble_fast.nc (auto-finds IBTrACS radii
-# in data/ibtracs/_cache, window = full record after fc_start):
-python run.py --ensemble --stage wind
-
-# knobs: thresholds, window, grid spacing
-python run.py --ensemble --stage wind --wind-thresholds 34,50,64 \
-    --wind-window-h 120 --wind-grid 0.25
+# re-run a single stage on existing outputs
+python run.py --ensemble --stage wind        # wind probability only
+python run.py --ensemble --stage plot        # intensity plots only
 ```
 
-Outputs `wind_prob.nc` (probability + member counts on a lat/lon grid) and
-`wind_prob.png/svg` (map background, ensemble tracks, best track, 10/50%
-contours; <5% probabilities are treated as no-signal and left transparent,
-per NHC convention). See "Wind-field model" below for the physics chain.
+All paths and experiment knobs resolve from `config.txt`. Output lands in
+`data/ensemble/{storm}_{env}/`. On Slurm: `sbatch ens_flossie_gefs_default.slurm`.
 
-With a later GEFS init than the IBTrACS record start (e.g. `--gefs-init
-"2025-06-30 12:00"`), the environment chain becomes **dual-source**: the
-replay window `[fc_start - replay_hours, fc_start)` runs on ERA5 analysis
-fields (Lin et al. 2020 Sec.3e convention) while the forecast segment runs
-on the selected GEFS member. The replay window is always clipped to the
-IBTrACS record start — never extrapolated pre-genesis — and degenerates to
-a cold start automatically when the record starts at/after `fc_start`
-(the shipped 06-29 06Z demo case). `--no-kl` disables the appendix-B KL
-perturbation; `--replay-hours` sets the window (default 48 h).
+## Pipeline stages (`run.py --stage`)
+
+| stage | does | output |
+|---|---|---|
+| `ibtracs` | download best-track CSVs | `data/ibtracs/` |
+| `eprep` | per-member env extraction (vortex removal, scalars) | `{STORM}_M{NNN}/_dataset.pkl` |
+| `ode` | FAST intensity ODE per member | `ensemble_fast.nc`, `ensemble_summary.nc` |
+| `plot` | intensity spaghetti + mean plots | `ensemble_fast.png/svg` |
+| `wind` | CLE15 wind field -> exceedance probability | `wind_prob.nc`, `wind_prob.png/svg` |
 
 ## Configuration (`config.txt`)
 
 | key | meaning |
 |---|---|
-| `storms`, `basins`, `year_start/end` | storm selection (demo: Flossie EP 2025) |
-| `gefs_dir_flossie` | local GEFS forecast nc dir (`data/gefs_flossie`, 93 files) |
-| `gefs_init_flossie` | GEFS init time `2025-06-29 06:00` |
-| `synth_gefs_nc_flossie` | pre-generated synthetic-track NC (1000 members) |
-| `synth_ecmwf_nc_flossie` | optional ECMWF-parent NC for `--env era5` |
-| `era5_dir` | local ERA5 analysis crop (SST/BLH/MSL fallback chain) |
+| `storms`, `basins`, `year_start/end` | storm selection |
+| `gefs_dir_{tag}` / `gefs_init_{tag}` | local GEFS forecast dir + init cycle |
+| `synth_gefs_nc_{tag}` / `synth_ecmwf_nc_{tag}` | synthetic-track NC |
+| `era5_dir` | local ERA5 analysis crop |
+| `env` | environment source: `gefs` (forecast) or `era5` (analysis) |
+| `vortex_mode` | `annulus` (200–800 km mean) or `surgery` (global fields only) |
+| `ode_mode` | `cold` / `fhlo` (obs replay + KL + F) / `free` (replay + KL) |
+| `replay_hours`, `kl_perturb` | obs-replay window, appendix-B KL perturbation |
 | `vp_comp_gefs` / `vp_comp_era5` | Vp bias compensation (1.1 / 1.0) |
-| `ode_mode` | ODE init: `cold` (default) / `fhlo` (obs replay + KL + F) / `free` |
-| `replay_hours` | obs replay window before fc_start (48; clipped to IBTrACS start) |
-| `kl_perturb` | 1 = KL(n=10) observed-history perturbation (appendix B) |
 | `n_workers` | process-pool size |
-
-`era5_root` / `oisst_root` / `ecmwf_root` / `gefs_grib_root` point at the
-original community archives and are used **only** by `download/` crop scripts
-and `tracks/` generation — never by `run.py` prep/ode stages, which read
-exclusively from the local `data/` tree shipped here.
-
-## Bundled data (all inside this workspace)
-
-```
-data/ibtracs/EP/2025/2025180N13261_FLOSSIE/   best-track pkl + 1h/6h CSVs
-data/gefs_flossie/                            31 members x (pgrb2a+pgrb2b+skt) nc, 0.5° regional
-data/era5/                                    T/Q/U/V/Z 2025-06-27..07-08 + SSTK/MSL/BLH/SP monthly (0.25° global)
-tracks/processed/flossie_2025/2025062906_gefs/ raw.pkl + markov + synthetic_tracks_1000members.nc
-precalc_data/                                 Cd.nc, mld/strat climatology, bathymetry, land (dynamic alpha)
-```
-
-Total ≈ 47 GB. Everything `run.py` touches is local; after unzipping the
-Google Drive archive the one command above reproduces the full ensemble with
-zero additional downloads.
-
-## Ensemble outputs (`data/ensemble/flossie_gefs/`)
-
-| file | content |
-|---|---|
-| `ensemble_fast.nc` | **final result**: `fast_vmax_kts (member, hour)` + `fast_chi`/`fast_s` (vent), `vp/v_obz/m`, `seq_len`, member codes |
-| `ensemble_fast.png/.svg` | spaghetti + mean/top10% + obs + vent panel (auto after ode) |
-| `ensemble_winds.csv` | long-format V(t) per member (easy pandas) |
-| `ensemble_summary.nc` | per-member coefficients: chi, u/v 250/850, shear, peak_kts |
-| `wind_prob.nc` | 34/50/64-kt wind-exceedance probability on a lat/lon grid (`--stage wind`) |
-| `wind_prob.png/.svg` | probability maps with map background + tracks (auto with wind stage) |
-| `{STORM}_M{NNN}/` | per-member slim `_dataset.pkl`, `fast_reference.csv`, `_track.csv`, `member_assignment.txt` |
-| `run_config.txt` | exact config used (env, vortex mode, members, vp_comp) |
-
-## How the ensemble works
-
-```
-TIGGE parents (GEFS kwbc)  [done once, NC shipped in tracks/processed/]
-   │ tracks/read_files.py -> build_pairs -> train_markov -> sample_tracks
-   │   (1000 members, parent_track kept for member-paired bootstrap)
-   ▼
-synthetic_tracks_1000members.nc ──┐ hourly splice w/ best-track vmax
- best-track dataset.pkl ──────────┤        (prep/prepare_ensemble_storm)
-                                  ▼
-              run.py --ensemble  (stage eprep, process pool)
-                --assign gefs     track's parent GEFS member directly
-                env: gefs -> ensemble/gefs_nc_adapter.py
-                     (pgrb2a+b merge, skt SST, fhour cache; p25-p30
-                      u/v/gh from a-stream, missing t/q levels log-p filled)
-                     era5 -> data/era5 analysis directly
-                                  ▼
-              run.py --ensemble  (stage ode)
-                physics/run_fast_reference.py per member — COLD START:
-                V(0) = first observed vmax (axisymmetric inversion),
-                m(0) = official _init_m inversion at dv/dt=0, then pure
-                physics; NO replay, NO F forcing, no obs afterwards
-                                  ▼
-              ensemble_fast.nc + ensemble_winds.csv + ensemble_summary.nc
-                                  ▼
-              ensemble_fast.png/svg  (ensemble/plot_ensemble_fast.py)
-                                  ▼
-              run.py --stage wind  (wind/wind_prob.py)
-                CLE15(V_axisym(t), r0, lat) -> V(r) -> shape-k ->
-                translation/shear asymmetry -> per-member 2-D field ->
-                DeMaria(2009) "ever-exceeded" probability per grid point
-                                  ▼
-              wind_prob.nc + wind_prob.png/svg  (34/50/64-kt)
-```
-
-- **Vortex removal**: `annulus` (200–800 km mean, default) on the regional
-  GEFS grid; strict Lin vortex `surgery` needs full-global fields and is
-  therefore only available with `--env era5`.
-- **Ocean coupling is always dynamic** (official `coupled_fast` Eq. 4-5):
-  α recomputed from the current V every 15-min sub-step via `precalc_data/`
-  monthly MLD/strat climatology + bathymetry; γ = ε + ακ.
-- **Cd chain** (official `geo.read_drag`): 10-m drag → gradient-height
-  correction `Cd/(1+250·Cd)` → normalized to open-ocean 1.2e-3; h_bl per
-  basin from the namelist `atm_bl_depth` (EP/NA 1400 m → coeff 1.543e-3/h).
-- **Vp compensation** 1.1 for GEFS (systematic 5-10% low bias vs ERA5
-  analysis; a maintained correction, not case tuning), 1.0 for ERA5.
-- Workers: jobs batched per GEFS member (fhour cache locality), BLAS threads
-  pinned to 1.
-
-## Deterministic single-track path (`run.py`, no ensemble)
-
-```bash
-python prep/IBtracs_datasets.py                    # IBTrACS -> 6h CSV (uses _cache)
-python run.py --storms 2025180N13261_FLOSSIE       # prep + FAST ODE
-# -> data/ibtracs/EP/2025/{STORM}/fast_reference.csv/.png
-```
-
-`{STORM}_dataset.pkl` keys: `scalars (1,T,4)` = α/β/γ/v_pot;
-`chi_ref/s_ref (1,T,1)`; `env_wnds (1,T,4)`; `v_gt/times/lats/lons`;
-`cd_ref/blh_ref/utran/vtran/hm_ref/strat_ref/bathy_ref`.
-
-## Synthetic-track regeneration (`tracks/`, optional)
-
-The shipped NC was generated from the GEFS TIGGE `kwbc` XML archive
-(`gefs_grib_root` in config); regenerating needs that archive:
-
-```bash
-python tracks/batch_generate.py --storms 2025180N13261_FLOSSIE --source gefs --init FLOSSIE:2025062906 --plot
-```
-
-Details: `tracks/README.md`. The demo never requires this step.
 
 ## Repository layout
 
 ```
-run.py                       single entry: prep/eprep/ode/plot/wind orchestration
-config.txt                   all paths + experiment knobs
-ens_flossie_gefs_default.slurm  HPC batch wrapper (1000 members)
-prep/      IBTrACS download; env extraction + scalars (dataset.pkl)
-physics/   run_fast_reference.py — FAST ODE (cold / fhlo replay / free)
-tracks/    TIGGE -> Markov -> 1000-member synthetic tracks
-ensemble/  gefs_nc_adapter.py (GEFS env), dual_env_adapter.py (ERA5 replay
-           + GEFS forecast routing), plot_ensemble_fast.py, download_fnv3.py
-wind/      CLE15 profile port + shape-k + asymmetry + (r0,k) radii fit +
-           wind-exceedance probability maps (run.py --stage wind)
-common/    thermo tables, vortex-inversion surgery library, spherical utils
-download/  crop scripts that BUILT data/era5 + data/gefs_flossie (optional)
-data/      local data (gitignored; ship via Google Drive)
+run.py          pipeline orchestrator (stages: eprep/ode/plot/wind)
+config.txt      all paths + experiment knobs
+prep/           IBTrACS download, env extraction (dataset.pkl)
+physics/        run_fast_reference.py — FAST ODE
+tracks/         TIGGE -> Markov -> synthetic tracks
+ensemble/       GEFS/ERA5 adapters, ensemble plotting
+wind/           CLE15 port + shape-k + asymmetry + (r0,k) fit + probability
+common/         thermo tables, vortex-inversion library
+data/           bundled local data (ship separately, ~47 GB)
 ```
 
-## Physics conventions
+## Reproducibility
 
-- **χ**: entropy-table `sat_deficit` at 600 hPa, 200–800 km annulus (EP:
-  50th percentile, 900 km renv); Lin calibration
-  `χ_eff = clip(exp(ln(χ+1e-3)+0.5)+1.3, 1e-5, 5)`; vent = χ_eff·s.
-- **(Ck, h_bl) = (1.2e-3, 1400 m)** for EP/NA (Lin namelist `atm_bl_depth`;
-  WP/AU 1800, SI 1600, SP 2000, NI 1500).
-- **Integration**: Heun, 4 sub-steps per hour; V_axisym → V_max via the
-  translation + 0.1·s·V/15 shear-tilt conversion at the end.
-- **75% survival rule** for Markov track training/sampling horizon.
-
-## Wind-field model (`wind/`)
-
-Direct port of the official FHLO wind model (Lin et al. 2020 Sec.3d-e) that
-converts each member's `V_axisym(t)` time series into a full 2-D surface
-wind field:
-
-1. **CLE15 radial profile** (`wind/cle15.py`): Python-3 port of the official
-   Chavas, Lin & Emanuel (2015) code (PURR DOI 10.4231/CZ4P-D448) — merges
-   the Emanuel & Rotunno (2011) inner solution with the Emanuel (2004)
-   outer solution at fixed `r0`. FHLO simplifications: `2Cd/w_cool = 1 s-1`,
-   `Ck/Cd = 1`, `Cd = 1.5e-3`.
-2. **Shape parameter k** (`wind_field.apply_shape_k`): `V(r,k) = V(r)^k`
-   for `r > rm`, correcting the CLE15 low bias at 3 ≤ r/rm ≤ 6.
-3. **Asymmetry** (`wind_field._asym_increment`): translation `G·ut`
-   (G latitude-dependent per Lin) + shear `0.1·s·V/15`, total increment
-   capped at 50% of `V` — identical to `physics/run_fast_reference.py`.
-4. **(r0, k) initialization** (`wind/init_radii.py`): joint two-stage grid
-   fit of `(r0, k, V_axisym)` to the IBTrACS 34/50/64-kt quadrant radii +
-   Vmax analysis at `fc_start` (falls back to r0=700 km, k=1 with no radii).
-5. **Probability** (`wind/wind_prob.py`): per-member "ever exceeded" flag
-   over the window, divided by member count (DeMaria 2009 definition). A
-   precomputed (V, lat) profile lookup table makes the 1000-member × 162-h
-   run take ~10 min instead of hours.
-
-Plotting (`wind/plot_wind_prob.py`) follows the repo's `tracks/plot_tracks.py`
-conventions: cartopy land/ocean background, probability fill transparent
-below 5%, gray member spaghetti, blue ensemble mean, black IBTrACS best
-track, 10%/50% contours.
-
-## Reproducibility notes
-
-- `run_config.txt` next to each ensemble output records the exact
-  configuration (storm, env source, vortex mode, members, vp_comp, init,
-  ode_mode, replay_hours, KL).
-- Reruns are resumable: existing per-member `_dataset.pkl`s are skipped
-  unless `--overwrite`.
-- In `cold` mode the ODE is deterministic per member; spread comes entirely
-  from the 1000 synthetic tracks x 31 GEFS parent members. In `fhlo`/`free`
-  modes the KL(n=10) observed-history perturbation (seed `100000 + member
-  id`, deterministic) adds IC spread on top, exactly per FHLO appendix B.
+- Each ensemble run records its exact configuration in `run_config.txt`.
+- Per-member outputs are resumable; existing pkls are skipped unless
+  `--overwrite`.
+- KL perturbation seeds are deterministic (`100000 + member id`).
+- All data used by `run.py` lives under the local `data/` tree; no
+  external paths or network access needed after setup.

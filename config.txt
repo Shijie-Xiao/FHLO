@@ -22,7 +22,11 @@ oisst_dir = data/oisst
 
 # ---- GEFS ensemble forecast (run.py --ensemble) ----
 #   gefs_dir_{tag}   : local GEFS nc dir (pgrb2a/pgrb2b/skt per member)
-#   gefs_init_{tag}  : GEFS forecast init time
+#   gefs_init_{tag}  : GEFS forecast init time (the cycle the env fields are from)
+#   fc_start_{tag}   : forecast start / ERA5->GEFS env handover. Default =
+#                      gefs_init; set LATER to replay obs on ERA5 analysis up
+#                      to that valid time inside the same GEFS cycle
+#                      (e.g. init 06-29 06Z + fc_start 06-30 12Z)
 #   synth_gefs_nc_{tag}   : tracks NC sampled from GEFS TIGGE parents (demo)
 #   synth_ecmwf_nc_{tag}  : tracks NC sampled from ECMWF TIGGE parents
 #       (optional chain: --env era5 pairs ERA5 analysis fields with these)
@@ -33,16 +37,41 @@ oisst_dir = data/oisst
 # --- Flossie 2025 (EP) default pipeline: GEFS tracks + GEFS env ---
 gefs_dir_flossie = data/gefs_flossie
 gefs_init_flossie = 2025-06-29 06:00
+fc_start_flossie = 2025-06-30 12:00
 synth_gefs_nc_flossie = tracks/processed/flossie_2025/2025062906_gefs/synthetic_tracks_1000members.nc
 synth_ecmwf_nc_flossie = tracks/processed/flossie_2025/2025062900/synthetic_tracks_1000members.nc
 vp_comp_gefs = 1.1
 vp_comp_era5 = 1.0
+
+# ---- Google WeatherLab FNV3 comparison overlay (plot stage) ----
+# CSV fetched by ensemble/download_fnv3.py at the SAME 6h cycle as the
+# forecast start (fc_start = gefs_init, or a later --fc-start); EP062025 is
+# Flossie's FNV3 track id. Remove these keys (or the csv) to plot without
+# the Google comparison.
+google_csv_flossie = data/google/FNV3_2025_06_30T12_00_paired.csv
+google_id_flossie = EP062025
 
 # ---- Remote / community archives (read by download/crop scripts, tracks/) ----
 era5_root = /global/cfs/cdirs/m5011/Jay/ERA5
 oisst_root = /global/cfs/cdirs/m5011/Jay/OHC
 ecmwf_root = /global/cfs/cdirs/m5011/Jay/TIGGE/ecmf
 gefs_grib_root = /global/cfs/cdirs/m5011/Jay/ERA5/GFS
+
+# ---- ODE initialization (physics/run_fast_reference.py) ----
+#   ode_mode     : cold = pure cold start (demo default, no obs nudging)
+#                  fhlo = FHLO Sec.2c init: obs replay + KL(n=10) perturbation
+#                         + F*exp(-(t/24h)^2) forecast forcing
+#                  free = replay + KL, no forecast-phase F forcing
+#   replay_hours : replay window before the forecast start (fc_start = the
+#                  GEFS init above); clipped to the IBTrACS record start.
+#                  The replay segment uses ERA5 analysis fields (dual-source
+#                  eprep); the forecast segment uses the GEFS member fields.
+#   kl_perturb   : 1 = KL(n=10, piecewise sigma^2_y) perturbation of the
+#                  observed history (last 24 h of the replay window) for IC
+#                  spread (FHLO appendix B); 0 = off
+ode_mode = cold
+replay_hours = 48
+kl_perturb = 1
 
 # ---- Parallelism ----
 n_workers = 4
